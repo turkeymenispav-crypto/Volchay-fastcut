@@ -3,6 +3,7 @@
 #include "util/log.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 
 namespace volchay::media {
@@ -32,8 +33,19 @@ const char* hr_name(HRESULT hr) {
 
 }  // namespace
 
-MfPlayer::MfPlayer()  = default;
-MfPlayer::~MfPlayer() { close(); }
+MfPlayer::MfPlayer() {
+    worker_ = std::thread(&MfPlayer::worker_main, this);
+}
+
+MfPlayer::~MfPlayer() {
+    quit_.store(true);
+    {
+        std::lock_guard lk(mu_);
+        close_request_pending_ = true;
+    }
+    cv_.notify_all();
+    if (worker_.joinable()) worker_.join();
+}
 
 bool MfPlayer::ensure_started() {
     bool expected = false;
@@ -50,16 +62,297 @@ bool MfPlayer::ensure_started() {
     return true;
 }
 
-bool MfPlayer::create_reader(const std::wstring& path) {
-    // First attempt: hardware decode through DXVA. Falls back to software
-    // automatically if the source is DRM-protected, the driver doesn't
-    // support DXVA, or the requested format conversion fails.
+// ---------------------------------------------------------------------------
+// UI thread API
+// ---------------------------------------------------------------------------
+
+bool MfPlayer::open(const std::wstring& path, ID3D11Device* device) {
+    if (!device) return false;
+
+    // Tear down any previous open synchronously (so the worker is idle
+    // before we hand it a new request).
+    {
+        std::lock_guard lk(mu_);
+        close_request_pending_ = true;
+    }
+    cv_.notify_all();
+    for (int i = 0; i < 200 && reader_open_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    device_ = ComPtr<ID3D11Device>(device);
+    device_->GetImmediateContext(context_.put());
+    source_path_ = path;
+    current_pts_.store(-1);
+    seek_target_.store(0);
+    target_pts_.store(0);
+    decode_kick_.store(true);
+
+    open_done_.store(false);
+    {
+        std::lock_guard lk(mu_);
+        pending_path_ = path;
+        open_request_pending_ = true;
+    }
+    cv_.notify_all();
+
+    // Block on the metadata-probe phase only. The slow part — decoder
+    // init for HEVC/4K — happens here on the worker, but the UI thread
+    // call site needs duration/width/height available the moment
+    // open() returns (project.add_media + set_single_clip read them
+    // synchronously). The first frame decode that follows is what we
+    // really want off the UI thread, and that runs asynchronously now.
+    // Cap at 5 s so a hung decoder can't permanently freeze the UI.
+    const auto deadline = std::chrono::steady_clock::now()
+                        + std::chrono::seconds(5);
+    while (!open_done_.load()
+        && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return reader_open_.load();
+}
+
+void MfPlayer::close() {
+    {
+        std::lock_guard lk(mu_);
+        close_request_pending_ = true;
+    }
+    cv_.notify_all();
+    // Wait for the worker to actually release the reader.
+    for (int i = 0; i < 1000 && reader_open_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // UI-side state.
+    srv_.reset();
+    texture_.reset();
+    context_.reset();
+    device_.reset();
+    source_path_.clear();
+    width_.store(0);
+    height_.store(0);
+    fps_.store(0.0);
+    duration_.store(0);
+    current_pts_.store(-1);
+    hardware_decode_.store(false);
+    {
+        std::lock_guard lk(buf_mu_);
+        shared_buf_.clear();
+        shared_buf_w_ = 0;
+        shared_buf_h_ = 0;
+        shared_buf_pts_ = -1;
+    }
+    frame_ready_.store(false);
+}
+
+void MfPlayer::seek(core::TimeUs t) {
+    if (!reader_open_.load()) return;
+    if (t < 0) t = 0;
+    const core::TimeUs dur = duration_.load();
+    if (dur > 0 && t > dur) t = dur;
+    seek_target_.store(t);
+    target_pts_.store(t);
+    decode_kick_.store(true);
+    // Pre-emptively reflect the seek on current_pts_ — without this the
+    // viewer briefly shows a stale frame's PTS until the worker decodes
+    // the new one.
+    current_pts_.store(t);
+    cv_.notify_all();
+}
+
+bool MfPlayer::pump(core::TimeUs playhead_us) {
+    if (!reader_open_.load()) return false;
+
+    // Tell the worker how far ahead we want frames to be ready. This is
+    // also how the worker knows we're "playing forward" — when target_pts
+    // moves past current_pts the worker decodes the next frame.
+    target_pts_.store(playhead_us);
+
+    bool uploaded = false;
+
+    if (frame_ready_.exchange(false)) {
+        std::lock_guard lk(buf_mu_);
+        if (!shared_buf_.empty() && texture_ && context_) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            HRESULT hr_map = context_->Map(texture_.get(), 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+            if (SUCCEEDED(hr_map)) {
+                const size_t row_bytes = size_t(shared_buf_w_) * 4;
+                BYTE*       dst = (BYTE*)mapped.pData;
+                const BYTE* src = shared_buf_.data();
+                for (int y = 0; y < shared_buf_h_; ++y) {
+                    std::memcpy(dst + size_t(y) * mapped.RowPitch,
+                                src + size_t(y) * row_bytes,
+                                row_bytes);
+                }
+                context_->Unmap(texture_.get(), 0);
+                current_pts_.store(shared_buf_pts_);
+                uploaded = true;
+            } else {
+                log::warn("Map(dynamic) failed 0x%08lx", long(hr_map));
+            }
+        }
+    }
+
+    // Decide whether to ask the worker for another frame.
+    const core::TimeUs cur = current_pts_.load();
+    const double      f   = fps_.load();
+    const core::TimeUs frame_time = (f > 0.0)
+        ? core::TimeUs(1'000'000.0 / f)
+        : core::TimeUs(16'000);
+    if (cur < 0 || playhead_us >= cur + frame_time) {
+        if (!decode_kick_.exchange(true)) {
+            cv_.notify_all();
+        }
+    }
+    return uploaded;
+}
+
+// ---------------------------------------------------------------------------
+// Worker thread
+// ---------------------------------------------------------------------------
+
+void MfPlayer::worker_main() {
+    HRESULT init = ::CoInitializeEx(nullptr,
+                                    COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
+
+    while (!quit_.load()) {
+        bool         do_open  = false;
+        bool         do_close = false;
+        std::wstring path;
+
+        {
+            std::unique_lock lk(mu_);
+            cv_.wait_for(lk, std::chrono::milliseconds(20), [&] {
+                return quit_.load()
+                    || open_request_pending_
+                    || close_request_pending_
+                    || decode_kick_.load();
+            });
+            if (open_request_pending_) {
+                do_open = true;
+                open_request_pending_ = false;
+                path = pending_path_;
+            }
+            if (close_request_pending_) {
+                do_close = true;
+                close_request_pending_ = false;
+            }
+        }
+
+        if (do_close) {
+            worker_release_reader();
+        }
+        if (do_open) {
+            // close any still-live previous reader
+            worker_release_reader();
+            if (!worker_open(path)) {
+                log::err("MfPlayer worker: open failed");
+                worker_release_reader();
+            }
+            // Either path: signal completion to the UI thread.
+            open_done_.store(true);
+        }
+
+        if (!reader_open_.load()) continue;
+
+        // Apply pending seek before decode.
+        const core::TimeUs seek = seek_target_.exchange(-1);
+        if (seek >= 0 && reader_) {
+            PROPVARIANT pv;
+            ::PropVariantInit(&pv);
+            pv.vt = VT_I8;
+            pv.hVal.QuadPart = us_to_mftime(seek);
+            reader_->SetCurrentPosition(GUID_NULL, pv);
+            ::PropVariantClear(&pv);
+            pending_seek_ = seek;
+            worker_pts_   = -1;
+        }
+
+        // Decode at most one frame per signal — UI re-kicks us when it
+        // wants the next one. This caps decode work to the actual
+        // display rate without ever doing it on the UI thread.
+        if (decode_kick_.exchange(false)) {
+            const core::TimeUs target = target_pts_.load();
+            worker_decode_one(target);
+        }
+    }
+
+    worker_release_reader();
+    if (SUCCEEDED(init)) ::CoUninitialize();
+}
+
+bool MfPlayer::worker_open(const std::wstring& path) {
+    if (!ensure_started())  return false;
+    if (!device_)           return false;
+
+    if (!worker_create_reader(path))         return false;
+    if (!worker_configure_output_format())   return false;
+
+    // Create the dynamic texture. ID3D11Device::CreateTexture2D /
+    // CreateShaderResourceView are thread-safe in default (non-singlethreaded)
+    // device creation mode, which D3DContext uses.
+    const int w = width_.load();
+    const int h = height_.load();
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width            = UINT(w);
+    td.Height           = UINT(h);
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DYNAMIC;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
+
+    ComPtr<ID3D11Texture2D>          tex;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    HRESULT hr = device_->CreateTexture2D(&td, nullptr, tex.put());
+    if (FAILED(hr)) {
+        log::err("CreateTexture2D(dynamic) failed 0x%08lx", long(hr));
+        return false;
+    }
+    hr = device_->CreateShaderResourceView(tex.get(), nullptr, srv.put());
+    if (FAILED(hr)) {
+        log::err("CreateShaderResourceView 0x%08lx", long(hr));
+        return false;
+    }
+    texture_ = tex;
+    srv_     = srv;
+
+    {
+        std::lock_guard lk(buf_mu_);
+        shared_buf_.assign(size_t(w) * size_t(h) * 4, 0);
+        shared_buf_w_   = w;
+        shared_buf_h_   = h;
+        shared_buf_pts_ = -1;
+    }
+    frame_ready_.store(false);
+    pending_seek_ = -1;
+    worker_pts_   = -1;
+
+    log::info("Video texture ready: %dx%d BGRA8 (dynamic)", w, h);
+    reader_open_.store(true);
+    return true;
+}
+
+void MfPlayer::worker_release_reader() {
+    reader_open_.store(false);
+    reader_.reset();
+    dxgi_manager_.reset();
+    width_.store(0);
+    height_.store(0);
+    fps_.store(0.0);
+    duration_.store(0);
+    hardware_decode_.store(false);
+    pending_seek_ = -1;
+    worker_pts_   = -1;
+}
+
+bool MfPlayer::worker_create_reader(const std::wstring& path) {
     auto try_open = [&](bool with_dxva) -> bool {
         ComPtr<IMFAttributes> attrs;
         if (FAILED(::MFCreateAttributes(attrs.put(), 6))) return false;
 
-        // ENABLE_VIDEO_PROCESSING gives us colour-space conversion (so we
-        // can request RGB32 even when the decoder produces NV12).
         attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
 
@@ -81,23 +374,24 @@ bool MfPlayer::create_reader(const std::wstring& path) {
             attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, TRUE);
         }
 
+        ComPtr<IMFSourceReader> r;
         HRESULT hr = ::MFCreateSourceReaderFromURL(path.c_str(), attrs.get(),
-                                                   reader_.put());
+                                                   r.put());
         if (FAILED(hr)) {
             log::warn("MFCreateSourceReaderFromURL(%s) 0x%08lx (%s)",
                       with_dxva ? "HW" : "SW", long(hr), hr_name(hr));
-            reader_.reset();
             dxgi_manager_.reset();
             return false;
         }
-        reader_->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-        reader_->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-        hardware_decode_ = with_dxva;
+        r->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
+        r->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
+        reader_ = r;
+        hardware_decode_.store(with_dxva);
         return true;
     };
 
-    hardware_decode_ = false;
-    if (prefer_hardware_ && device_ && try_open(/*with_dxva=*/true)) {
+    hardware_decode_.store(false);
+    if (prefer_hardware_.load() && device_ && try_open(/*with_dxva=*/true)) {
         log::info("MF: source reader opened (DXVA hardware decode)");
         return true;
     }
@@ -109,13 +403,9 @@ bool MfPlayer::create_reader(const std::wstring& path) {
     return true;
 }
 
-bool MfPlayer::configure_output_format() {
+bool MfPlayer::worker_configure_output_format() {
     if (!reader_) return false;
 
-    // Ask the reader to deliver RGB32 (BGRA on the wire). When the
-    // ENABLE_VIDEO_PROCESSING attribute is set the reader inserts the
-    // Color Converter MFT automatically, so this should succeed for any
-    // stream the decoder can produce.
     auto try_set = [&](const GUID& subtype) -> bool {
         ComPtr<IMFMediaType> out_type;
         if (FAILED(::MFCreateMediaType(out_type.put()))) return false;
@@ -131,14 +421,15 @@ bool MfPlayer::configure_output_format() {
     };
 
     if (!try_set(MFVideoFormat_RGB32)) {
-        // Some hardware decoders won't expose RGB32 conversion. Retry
-        // with software decode to guarantee we get pixels we can upload.
         log::warn("RGB32 output unavailable on current reader; "
                   "rebuilding reader in software mode");
         reader_.reset();
         dxgi_manager_.reset();
-        hardware_decode_ = false;
-        if (!create_reader(source_path_)) return false;
+        hardware_decode_.store(false);
+        // Reuse the same path stored on the UI side. This worker is the
+        // only thread that touches reader_, so it's safe to call
+        // worker_create_reader here.
+        if (!worker_create_reader(source_path_)) return false;
         if (!try_set(MFVideoFormat_RGB32)) {
             log::err("RGB32 output unavailable even on SW reader");
             return false;
@@ -153,20 +444,20 @@ bool MfPlayer::configure_output_format() {
 
     UINT32 w = 0, h = 0;
     ::MFGetAttributeSize(got.get(), MF_MT_FRAME_SIZE, &w, &h);
-    width_  = int(w);
-    height_ = int(h);
+    width_.store(int(w));
+    height_.store(int(h));
 
     UINT32 num = 0, den = 0;
     if (SUCCEEDED(::MFGetAttributeRatio(got.get(), MF_MT_FRAME_RATE, &num, &den))
         && den != 0) {
-        fps_ = double(num) / double(den);
+        fps_.store(double(num) / double(den));
     }
 
     LONG stride = 0;
     if (SUCCEEDED(got->GetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32*)&stride))) {
         stride_ = stride;
     } else {
-        stride_ = LONG(width_) * 4;
+        stride_ = LONG(int(w)) * 4;
     }
 
     PROPVARIANT pv;
@@ -174,113 +465,25 @@ bool MfPlayer::configure_output_format() {
     if (SUCCEEDED(reader_->GetPresentationAttribute(
             MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))) {
         if (pv.vt == VT_UI8) {
-            duration_ = mftime_to_us((LONGLONG)pv.uhVal.QuadPart);
+            duration_.store(mftime_to_us((LONGLONG)pv.uhVal.QuadPart));
         }
     }
     ::PropVariantClear(&pv);
 
     log::info("MF stream: %dx%d @ %.3f fps, stride %ld, duration %.3fs (%s)",
-              width_, height_, fps_, long(stride_),
-              core::to_seconds(duration_),
-              hardware_decode_ ? "HW decode" : "SW decode");
-    return width_ > 0 && height_ > 0;
+              int(w), int(h), fps_.load(), long(stride_),
+              core::to_seconds(duration_.load()),
+              hardware_decode_.load() ? "HW decode" : "SW decode");
+    return w > 0 && h > 0;
 }
 
-bool MfPlayer::ensure_texture(int w, int h, ID3D11Device* device) {
-    if (texture_ && srv_) return true;
-
-    // Dynamic texture mapped with WRITE_DISCARD every frame. The
-    // discard semantics tell the driver "I don't care about the old
-    // contents, give me a fresh backing buffer if necessary" so we
-    // never stall on the GPU read pipeline ImGui issues.
-    D3D11_TEXTURE2D_DESC td{};
-    td.Width            = UINT(w);
-    td.Height           = UINT(h);
-    td.MipLevels        = 1;
-    td.ArraySize        = 1;
-    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
-    td.SampleDesc.Count = 1;
-    td.Usage            = D3D11_USAGE_DYNAMIC;
-    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
-
-    HRESULT hr = device->CreateTexture2D(&td, nullptr, texture_.put());
-    if (FAILED(hr)) {
-        log::err("CreateTexture2D(dynamic) failed 0x%08lx", long(hr));
-        return false;
-    }
-    hr = device->CreateShaderResourceView(texture_.get(), nullptr, srv_.put());
-    if (FAILED(hr)) {
-        log::err("CreateShaderResourceView 0x%08lx", long(hr));
-        return false;
-    }
-
-    log::info("Video texture ready: %dx%d BGRA8 (dynamic)", w, h);
-    return true;
-}
-
-bool MfPlayer::open(const std::wstring& path, ID3D11Device* device) {
-    close();
-    if (!ensure_started()) return false;
-    if (!device)           return false;
-
-    source_path_ = path;
-    device_ = ComPtr<ID3D11Device>(device);   // AddRef'd by ComPtr ctor
-    device_->GetImmediateContext(context_.put());
-
-    if (!create_reader(path))         { close(); return false; }
-    if (!configure_output_format())   { close(); return false; }
-    if (!ensure_texture(width_, height_, device_.get())) {
-        close(); return false;
-    }
-
-    pending_seek_ = 0;
-    current_pts_  = -1;
-    return true;
-}
-
-void MfPlayer::close() {
-    reader_.reset();
-    dxgi_manager_.reset();
-    srv_.reset();
-    texture_.reset();
-    context_.reset();
-    device_.reset();
-    source_path_.clear();
-    width_ = height_ = 0;
-    stride_ = 0;
-    fps_ = 0.0;
-    duration_ = 0;
-    current_pts_  = -1;
-    pending_seek_ = -1;
-    hardware_decode_ = false;
-}
-
-void MfPlayer::seek(core::TimeUs t) {
-    if (!reader_) return;
-    if (t < 0) t = 0;
-    if (duration_ > 0 && t > duration_) t = duration_;
-    pending_seek_ = t;
-}
-
-bool MfPlayer::decode_to(core::TimeUs target_us) {
+bool MfPlayer::worker_decode_one(core::TimeUs target_us) {
     if (!reader_) return false;
-
-    if (pending_seek_ >= 0) {
-        PROPVARIANT pv;
-        ::PropVariantInit(&pv);
-        pv.vt = VT_I8;
-        pv.hVal.QuadPart = us_to_mftime(pending_seek_);
-        reader_->SetCurrentPosition(GUID_NULL, pv);
-        ::PropVariantClear(&pv);
-        pending_seek_ = -1;
-        current_pts_  = -1;
-    }
 
     int sample_count = 0;
     while (true) {
         if (++sample_count > 64) {
-            log::warn("decode_to: 64 samples without delivering one — bailing");
+            log::warn("worker_decode_one: 64 reads without a sample — bailing");
             return false;
         }
         DWORD       stream_index = 0;
@@ -305,17 +508,15 @@ bool MfPlayer::decode_to(core::TimeUs target_us) {
         }
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
             log::info("ReadSample: media type changed mid-stream; reconfiguring");
-            configure_output_format();
+            worker_configure_output_format();
         }
-        if (!sample) {
-            // Stream tick without a sample. Loop again.
-            continue;
-        }
+        if (!sample) continue;  // stream tick without payload
 
-        core::TimeUs pts = mftime_to_us(timestamp_mf);
+        const core::TimeUs pts = mftime_to_us(timestamp_mf);
 
         bool keep = true;
-        if (fps_ > 0.0 && pts + core::TimeUs(1'000'000.0 / fps_) < target_us) {
+        const double f = fps_.load();
+        if (f > 0.0 && pts + core::TimeUs(1'000'000.0 / f) < target_us) {
             keep = false;
         }
         if (!keep) continue;
@@ -330,60 +531,35 @@ bool MfPlayer::decode_to(core::TimeUs target_us) {
             continue;
         }
 
-        // Map the dynamic texture with DISCARD and copy each row,
-        // honouring the (possibly negative) MF stride so bottom-up
-        // RGB32 streams render right-side up.
-        D3D11_MAPPED_SUBRESOURCE mapped{};
-        HRESULT hr_map = context_->Map(texture_.get(), 0,
-                                       D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr_map)) {
-            const LONG src_stride = stride_ != 0 ? stride_ : LONG(width_) * 4;
+        // Copy into shared_buf_ honouring (possibly negative) MF stride.
+        {
+            std::lock_guard lk(buf_mu_);
+            const int w = shared_buf_w_;
+            const int h = shared_buf_h_;
+            const LONG src_stride = stride_ != 0 ? stride_ : LONG(w) * 4;
             const BYTE* src = data;
-            BYTE*       dst = (BYTE*)mapped.pData;
             const bool flip = src_stride < 0;
             const LONG row  = flip ? -src_stride : src_stride;
-            if (flip) src = data + LONG(height_ - 1) * row;
-            const size_t row_bytes = size_t(width_) * 4;
-            for (int y = 0; y < height_; ++y) {
-                std::memcpy(dst + size_t(y) * mapped.RowPitch, src, row_bytes);
+            if (flip) src = data + LONG(h - 1) * row;
+            const size_t row_bytes = size_t(w) * 4;
+            unsigned char* dst = shared_buf_.data();
+            for (int y = 0; y < h; ++y) {
+                std::memcpy(dst + size_t(y) * row_bytes, src, row_bytes);
                 src = flip ? src - row : src + row;
             }
-            context_->Unmap(texture_.get(), 0);
-        } else {
-            log::warn("Map(dynamic) failed 0x%08lx", long(hr_map));
+            shared_buf_pts_ = pts;
         }
 
         buffer->Unlock();
-        if (current_pts_ < 0) {
-            log::info("First frame uploaded (pts=%.3fs, %dx%d, %s)",
-                      core::to_seconds(pts), width_, height_,
-                      hardware_decode_ ? "HW" : "SW");
+        if (worker_pts_ < 0) {
+            log::info("First frame decoded (pts=%.3fs, %dx%d, %s)",
+                      core::to_seconds(pts), width_.load(), height_.load(),
+                      hardware_decode_.load() ? "HW" : "SW");
         }
-        current_pts_ = pts;
+        worker_pts_ = pts;
+        frame_ready_.store(true);
         return true;
     }
-}
-
-bool MfPlayer::pump(core::TimeUs playhead_us) {
-    if (!reader_) return false;
-
-    if (current_pts_ < 0) {
-        return decode_to(playhead_us < 0 ? 0 : playhead_us);
-    }
-
-    if (pending_seek_ >= 0) {
-        return decode_to(pending_seek_);
-    }
-
-    if (fps_ > 0.0) {
-        const core::TimeUs frame_time = core::TimeUs(1'000'000.0 / fps_);
-        if (playhead_us >= current_pts_ + frame_time) {
-            return decode_to(playhead_us);
-        }
-    } else if (playhead_us > current_pts_ + 16'000) {
-        return decode_to(playhead_us);
-    }
-    return false;
 }
 
 }  // namespace volchay::media

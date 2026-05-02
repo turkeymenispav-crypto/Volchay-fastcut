@@ -96,7 +96,12 @@ void AudioPlayer::close() {
 void AudioPlayer::play()             { playing_.store(true);  cv_.notify_all(); }
 void AudioPlayer::pause()            { playing_.store(false); cv_.notify_all(); }
 void AudioPlayer::seek(core::TimeUs t) {
-    seek_target_.store(std::max<core::TimeUs>(0, t));
+    const auto target = std::max<core::TimeUs>(0, t);
+    seek_target_.store(target);
+    // Optimistically reflect the requested position so that the visual
+    // playhead snaps immediately even though the worker thread takes a
+    // few ms (one cv_ wake-up + Reset/Start) to actually apply it.
+    current_pts_us_.store(target);
     cv_.notify_all();
 }
 void AudioPlayer::set_volume(float v) {
@@ -121,6 +126,17 @@ struct Worker {
     UINT32                      bits        = 32;       // float32 by default.
     bool                        is_float    = true;
     core::TimeUs                stream_pts_us = 0;
+
+    // Master-clock anchor: master = origin_us + (pos_now - origin_pos)/freq.
+    // The IAudioClock device position counts frames played out by WASAPI
+    // since the last Stop()/Reset() — so it's NOT a file PTS. We anchor
+    // it on every Start() and on every seek so that subtracting the anchor
+    // gives us elapsed-since-this-segment, which then maps onto the file's
+    // PTS by adding the segment's origin.
+    core::TimeUs                clock_origin_us  = 0;
+    UINT64                      clock_origin_pos = 0;
+    bool                        clock_dirty      = true;
+    bool                        device_running   = false;  // Start() called?
 };
 
 bool create_device(AudioDevice& d) {
@@ -298,14 +314,22 @@ void AudioPlayer::worker_main() {
             }
             has_audio_.store(true);
             current_pts_us_.store(0);
-            seek_target_.store(0);
+            seek_target_.store(-1);
+            w.stream_pts_us    = 0;
+            w.clock_origin_us  = 0;
+            w.clock_origin_pos = 0;
+            w.clock_dirty      = true;
+            w.device_running   = false;
             log::info("Audio engine ready: %u Hz, %u ch", w.sample_rate, w.channels);
         }
 
         if (!has_audio_.load()) continue;
 
-        // Apply pending seek.
-        core::TimeUs seek = seek_target_.exchange(-1);
+        // Apply pending seek. We have to Stop+Reset the device so the
+        // pre-seek ring-buffer is dropped (otherwise WASAPI keeps playing
+        // the old samples for ~60ms after the seek), and Reset() also
+        // zeroes the IAudioClock position, so we re-anchor the master clock.
+        const core::TimeUs seek = seek_target_.exchange(-1);
         if (seek >= 0 && w.reader) {
             PROPVARIANT pv;
             ::PropVariantInit(&pv);
@@ -313,22 +337,44 @@ void AudioPlayer::worker_main() {
             pv.hVal.QuadPart = us_to_mftime(seek);
             w.reader->SetCurrentPosition(GUID_NULL, pv);
             ::PropVariantClear(&pv);
+            if (w.device_running) {
+                w.dev.client->Stop();
+                w.dev.client->Reset();
+                w.device_running = false;
+            }
             w.pcm.clear();
-            w.pcm_offset = 0;
-            w.stream_pts_us = seek;
+            w.pcm_offset      = 0;
+            w.stream_pts_us   = seek;
+            w.clock_origin_us = seek;
+            w.clock_dirty     = true;
             current_pts_us_.store(seek);
         }
 
         if (!playing_.load()) {
-            // Stop the WASAPI stream so other apps aren't blocked. The
-            // device-side ring buffer is dropped, which gives an instant
-            // pause (no trailing samples after the user clicks Pause).
-            w.dev.client->Stop();
-            w.dev.client->Reset();
+            // Pause: stop the WASAPI stream so other apps aren't blocked
+            // and the device-side ring buffer is dropped. Reset() also
+            // clears the position counter, so the next play needs a
+            // fresh anchor (clock_dirty=true). Don't touch
+            // current_pts_us_ — the visible playhead should freeze at
+            // whatever it was when the user paused.
+            if (w.device_running) {
+                w.dev.client->Stop();
+                w.dev.client->Reset();
+                w.device_running = false;
+            }
+            // Anchor on next play to whatever stream PTS we resume from.
+            w.clock_origin_us = w.stream_pts_us;
+            w.clock_dirty     = true;
             continue;
         }
         // Start the stream lazily.
-        w.dev.client->Start();
+        if (!w.device_running) {
+            if (SUCCEEDED(w.dev.client->Start())) {
+                w.device_running = true;
+                w.clock_origin_us = w.stream_pts_us;
+                w.clock_dirty     = true;
+            }
+        }
 
         // Block on the buffer event up to ~50 ms. WASAPI in event-driven
         // shared mode signals this whenever there's room for more audio,
@@ -401,14 +447,27 @@ void AudioPlayer::worker_main() {
         UINT32 frames_written = want_bytes / (w.channels * sizeof(float));
         w.dev.render->ReleaseBuffer(frames_written, 0);
 
-        // Update master clock from IAudioClock.
+        // Update master clock from IAudioClock. We anchor the device
+        // position counter every time we (re)Start the stream so that
+        // current_pts_us reports the FILE's PTS, not "frames played since
+        // Start()". Without this anchoring, every seek/resume snapped
+        // current_pts_us back near zero — which dragged the visual
+        // playhead (which uses current_pts_us as its master clock) to
+        // the start of the file every render frame.
         UINT64 pos = 0, freq = 0;
         if (SUCCEEDED(w.dev.clock->GetFrequency(&freq))
             && SUCCEEDED(w.dev.clock->GetPosition(&pos, nullptr))
             && freq > 0) {
-            core::TimeUs played_us = core::TimeUs(double(pos) * 1'000'000.0 /
-                                                  double(freq));
-            current_pts_us_.store(played_us);
+            if (w.clock_dirty) {
+                w.clock_origin_pos = pos;
+                w.clock_dirty      = false;
+            }
+            const UINT64 delta_pos = (pos > w.clock_origin_pos)
+                                   ? pos - w.clock_origin_pos
+                                   : 0;
+            const core::TimeUs played_us =
+                core::TimeUs(double(delta_pos) * 1'000'000.0 / double(freq));
+            current_pts_us_.store(w.clock_origin_us + played_us);
         } else {
             current_pts_us_.store(w.stream_pts_us);
         }

@@ -131,18 +131,55 @@ void Exporter::run_one_export(ExportRequest req) {
     }
     src->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
     src->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-    src->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM, TRUE);
+    bool source_has_audio =
+        SUCCEEDED(src->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+                                          TRUE));
 
-    // Force NV12 video (most encoders accept it natively).
+    // Probe the source's native video size + frame rate so we can set
+    // matching attributes on both the source-reader output type and the
+    // sink-writer output type. Without explicit size/fps the source
+    // reader silently keeps the decoder's default media type (or the
+    // partial NV12 type fails to negotiate), and the sink writer's H.264
+    // encoder rejects every frame — producing an audio-only .mp4.
+    UINT32 src_w = 0, src_h = 0, fps_num = 30, fps_den = 1;
+    {
+        ComPtr<IMFMediaType> native;
+        if (SUCCEEDED(src->GetNativeMediaType(
+                MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, native.put()))) {
+            ::MFGetAttributeSize (native.get(), MF_MT_FRAME_SIZE, &src_w, &src_h);
+            ::MFGetAttributeRatio(native.get(), MF_MT_FRAME_RATE,
+                                  &fps_num, &fps_den);
+        }
+    }
+    if (src_w == 0 || src_h == 0) {
+        set_status("Source has no readable video stream");
+        ::MFShutdown();
+        return;
+    }
+    if (fps_num == 0) { fps_num = 30; fps_den = 1; }
+
+    // Force NV12 video at the source's native size + rate. The encoder
+    // negotiation will then succeed because the input type carries every
+    // attribute (subtype, frame size, frame rate, interlace) the H.264
+    // encoder needs.
     {
         ComPtr<IMFMediaType> wanted;
         ::MFCreateMediaType(wanted.put());
         wanted->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         wanted->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12);
-        src->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                 nullptr, wanted.get());
+        wanted->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        ::MFSetAttributeSize (wanted.get(), MF_MT_FRAME_SIZE,  src_w,   src_h);
+        ::MFSetAttributeRatio(wanted.get(), MF_MT_FRAME_RATE,  fps_num, fps_den);
+        ::MFSetAttributeRatio(wanted.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        hr = src->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                      nullptr, wanted.get());
+        if (FAILED(hr)) {
+            set_status("Cannot set NV12 on source video stream");
+            ::MFShutdown();
+            return;
+        }
     }
-    {
+    if (source_has_audio) {
         ComPtr<IMFMediaType> wanted;
         ::MFCreateMediaType(wanted.put());
         wanted->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
@@ -152,8 +189,11 @@ void Exporter::run_one_export(ExportRequest req) {
         wanted->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE,     16);
         wanted->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT,     4);
         wanted->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 48000 * 4);
-        src->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-                                 nullptr, wanted.get());
+        if (FAILED(src->SetCurrentMediaType(
+                MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, wanted.get()))) {
+            // No fatal: keep going without audio.
+            source_has_audio = false;
+        }
     }
 
     // Probe duration for progress reporting.
@@ -195,7 +235,12 @@ void Exporter::run_one_export(ExportRequest req) {
         return;
     }
 
-    // Output video type.
+    // Output video type. We keep the source's native frame size + rate
+    // (preset.width/height/fps_* are intentionally ignored in V1) — that
+    // way the H.264 encoder sees matching input + output dimensions and
+    // doesn't need an inserted resizer MFT, which MF won't add
+    // automatically when driving SinkWriter directly. The preset still
+    // controls the bitrate and the H.264-vs-HEVC choice.
     ComPtr<IMFMediaType> out_video;
     ::MFCreateMediaType(out_video.put());
     out_video->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -203,48 +248,67 @@ void Exporter::run_one_export(ExportRequest req) {
     out_video->SetUINT32(MF_MT_AVG_BITRATE, UINT32(p.video_bitrate));
     out_video->SetUINT32(MF_MT_INTERLACE_MODE,
                          MFVideoInterlace_Progressive);
-    ::MFSetAttributeSize (out_video.get(), MF_MT_FRAME_SIZE,
-                          UINT32(p.width), UINT32(p.height));
-    ::MFSetAttributeRatio(out_video.get(), MF_MT_FRAME_RATE,
-                          UINT32(p.fps_num), UINT32(p.fps_den));
+    ::MFSetAttributeSize (out_video.get(), MF_MT_FRAME_SIZE,  src_w,   src_h);
+    ::MFSetAttributeRatio(out_video.get(), MF_MT_FRAME_RATE,  fps_num, fps_den);
     ::MFSetAttributeRatio(out_video.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
 
     DWORD video_idx = 0;
     hr = sw->AddStream(out_video.get(), &video_idx);
     if (FAILED(hr)) {
-        set_status("AddStream(video) failed");
+        set_status("AddStream(video) failed (encoder unavailable?)");
+        log::err("Exporter: AddStream(video) hr=0x%08lx", (long)hr);
         ::MFShutdown();
         return;
     }
 
     // Input video type (must match what the source reader delivers).
     ComPtr<IMFMediaType> in_video;
-    src->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, in_video.put());
-    sw->SetInputMediaType(video_idx, in_video.get(), nullptr);
+    hr = src->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                  in_video.put());
+    if (FAILED(hr)) {
+        set_status("Source video type unavailable");
+        log::err("Exporter: GetCurrentMediaType(video) hr=0x%08lx", (long)hr);
+        ::MFShutdown();
+        return;
+    }
+    hr = sw->SetInputMediaType(video_idx, in_video.get(), nullptr);
+    if (FAILED(hr)) {
+        set_status("Encoder rejected source video format");
+        log::err("Exporter: SetInputMediaType(video) hr=0x%08lx", (long)hr);
+        ::MFShutdown();
+        return;
+    }
 
     // Audio.
     DWORD audio_idx = (DWORD)-1;
-    ComPtr<IMFMediaType> out_audio;
-    ::MFCreateMediaType(out_audio.put());
-    out_audio->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-    out_audio->SetGUID(MF_MT_SUBTYPE,    MFAudioFormat_AAC);
-    out_audio->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
-    out_audio->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS,        2);
-    out_audio->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE,     16);
-    out_audio->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24'000);   // 192 kbps / 8
-    out_audio->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
+    if (source_has_audio) {
+        ComPtr<IMFMediaType> out_audio;
+        ::MFCreateMediaType(out_audio.put());
+        out_audio->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        out_audio->SetGUID(MF_MT_SUBTYPE,    MFAudioFormat_AAC);
+        out_audio->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        out_audio->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS,        2);
+        out_audio->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE,     16);
+        out_audio->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24'000);   // 192 kbps / 8
+        out_audio->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
 
-    if (SUCCEEDED(sw->AddStream(out_audio.get(), &audio_idx))) {
-        ComPtr<IMFMediaType> in_audio;
-        src->GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-                                 in_audio.put());
-        if (FAILED(sw->SetInputMediaType(audio_idx, in_audio.get(), nullptr))) {
-            audio_idx = (DWORD)-1;
+        if (SUCCEEDED(sw->AddStream(out_audio.get(), &audio_idx))) {
+            ComPtr<IMFMediaType> in_audio;
+            if (SUCCEEDED(src->GetCurrentMediaType(
+                    MF_SOURCE_READER_FIRST_AUDIO_STREAM, in_audio.put()))
+                && SUCCEEDED(sw->SetInputMediaType(audio_idx,
+                                                   in_audio.get(), nullptr))) {
+                // ok
+            } else {
+                audio_idx = (DWORD)-1;
+            }
         }
     }
 
-    if (FAILED(sw->BeginWriting())) {
+    hr = sw->BeginWriting();
+    if (FAILED(hr)) {
         set_status("BeginWriting failed");
+        log::err("Exporter: BeginWriting hr=0x%08lx", (long)hr);
         ::MFShutdown();
         return;
     }
@@ -261,6 +325,9 @@ void Exporter::run_one_export(ExportRequest req) {
 
     set_status("Encoding...");
     bool video_done = false, audio_done = (audio_idx == (DWORD)-1);
+    bool video_write_failed = false;
+    HRESULT first_video_err = S_OK;
+    UINT64 video_samples_written = 0;
 
     while (!cancel_.load() && (!video_done || !audio_done)) {
         DWORD stream = 0, flags = 0;
@@ -276,7 +343,17 @@ void Exporter::run_one_export(ExportRequest req) {
                     video_done = true;
                 } else {
                     sample->SetSampleTime(us_to_mftime(pts - req.trim_start_us));
-                    sw->WriteSample(video_idx, sample.get());
+                    HRESULT wh = sw->WriteSample(video_idx, sample.get());
+                    if (FAILED(wh)) {
+                        if (!video_write_failed) {
+                            first_video_err = wh;
+                            log::err("Exporter: WriteSample(video) hr=0x%08lx",
+                                     (long)wh);
+                        }
+                        video_write_failed = true;
+                    } else {
+                        ++video_samples_written;
+                    }
                     progress_.store(float(double(pts - req.trim_start_us) /
                                           double(span_us)));
                 }
@@ -304,6 +381,18 @@ void Exporter::run_one_export(ExportRequest req) {
     if (cancel_.load()) {
         set_status("Cancelled");
         sw->Finalize();
+        success_.store(false);
+    } else if (video_samples_written == 0) {
+        // No video frames made it past the encoder. Without this check
+        // the .mp4 would be finalized with an audio-only payload and the
+        // user would think "the export ran but my video is gone".
+        sw->Finalize();
+        char buf[96];
+        ::snprintf(buf, sizeof(buf),
+                   "Export failed: encoder rejected video (hr=0x%08lx)",
+                   (long)first_video_err);
+        set_status(buf);
+        log::err("%s", buf);
         success_.store(false);
     } else {
         sw->Finalize();
