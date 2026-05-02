@@ -126,12 +126,36 @@ void App::advance_playhead(double dt_seconds) {
     if (!project_.is_playing()) return;
     if (project_.duration() <= 0) return;
 
-    // When the audio engine has produced samples, treat its clock as the
-    // master and snap the visual playhead to it. Otherwise fall back to
-    // dt-based advance.
+    // The audio engine's clock is FILE PTS (offset inside the source
+    // media), but project_.playhead() is TIMELINE PTS (offset on the
+    // edit timeline, after trim / split / multi-clip layout). Translate
+    // file -> timeline through the active clip so trimming a clip
+    // doesn't desync audio from the visual playhead.
     core::TimeUs ph;
     if (audio_.has_audio() && audio_.current_pts_us() >= 0) {
-        ph = audio_.current_pts_us();
+        const core::TimeUs file_pts = audio_.current_pts_us();
+        const auto& clips = project_.clips();
+        const core::Clip* active = nullptr;
+        for (const auto& c : clips) {
+            if (file_pts >= c.src_in && file_pts < c.src_out) {
+                active = &c;
+                break;
+            }
+        }
+        if (active) {
+            const double dur_src = double(file_pts - active->src_in);
+            const double dur_tl  = (active->speed > 0.0)
+                                 ? dur_src / active->speed
+                                 : dur_src;
+            ph = active->t_in + core::TimeUs(dur_tl);
+        } else if (!clips.empty()) {
+            // Audio is past the trimmed-out tail (or before src_in).
+            // Treat as "reached end" for the active clip.
+            const auto& c = clips.front();
+            ph = (file_pts < c.src_in) ? c.t_in : c.t_out();
+        } else {
+            ph = file_pts;
+        }
     } else {
         ph = project_.playhead();
         ph += core::TimeUs(dt_seconds * 1'000'000.0);
@@ -139,7 +163,12 @@ void App::advance_playhead(double dt_seconds) {
     if (ph >= project_.duration()) {
         if (settings_.loop_playback) {
             ph = 0;
-            audio_.seek(0);
+            // Seek audio to the FILE PTS at timeline 0, which is the
+            // first clip's src_in (not necessarily 0 in the file).
+            core::TimeUs file_t = project_.source_time_at(0);
+            if (file_t < 0) file_t = 0;
+            audio_.seek(file_t);
+            player_.seek(file_t);
         } else {
             ph = project_.duration();
             project_.set_playing(false);
@@ -172,7 +201,13 @@ void App::render_one_frame() {
     advance_playhead(dt);
 
     if (player_.is_open()) {
-        player_.pump(project_.playhead());
+        // pump() wants FILE PTS, not timeline PTS — translate through
+        // the active clip so trimmed/split layouts request the right
+        // source frame.
+        const core::TimeUs tl = project_.playhead();
+        core::TimeUs file_t = project_.source_time_at(tl);
+        if (file_t < 0) file_t = tl;
+        player_.pump(file_t);
     }
 
     // Apply audio settings every frame (cheap atomics).

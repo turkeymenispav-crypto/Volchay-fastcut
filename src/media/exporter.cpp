@@ -114,8 +114,19 @@ void Exporter::run_one_export(ExportRequest req) {
     // MF picks the GPU-resident H.264/HEVC decoder MFT when one is
     // available — on a 4060 that means NVDEC for input.
     ComPtr<IMFAttributes> src_attrs;
-    ::MFCreateAttributes(src_attrs.put(), 4);
+    ::MFCreateAttributes(src_attrs.put(), 5);
+    // Enable both basic and advanced video processing. The advanced flag
+    // is what makes Media Foundation insert a Color Converter MFT for
+    // AV1 / 10-bit HEVC sources whose decoder output is P010 — without
+    // it the source reader silently keeps the decoder's native type and
+    // the H.264/HEVC encoder rejects every WriteSample with E_INVALIDARG.
     src_attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+    // MinGW's mfreadwrite.h doesn't expose this attribute even though it's
+    // been in the Windows SDK since Win8. The GUID is stable.
+    static const GUID kMfReaderAdvancedVideoProcessing = {
+        0x0f81da2c, 0xb537, 0x4672,
+        { 0xa8, 0xb2, 0xa6, 0x81, 0xb1, 0x73, 0x07, 0xa3 } };
+    src_attrs->SetUINT32(kMfReaderAdvancedVideoProcessing, TRUE);
     src_attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
                          req.hardware ? TRUE : FALSE);
     src_attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA,
@@ -261,16 +272,34 @@ void Exporter::run_one_export(ExportRequest req) {
         return;
     }
 
-    // Input video type (must match what the source reader delivers).
-    ComPtr<IMFMediaType> in_video;
+    // Input video type. Build explicitly so we control MF_MT_DEFAULT_STRIDE
+    // and PIXEL_ASPECT_RATIO — the encoder validates samples against these
+    // and will reject WriteSample with E_INVALIDARG if they're missing or
+    // mismatch the actual sample stride (typical AV1 path: the source
+    // reader's NV12 output has a stride attribute we need to surface to
+    // the encoder).
+    ComPtr<IMFMediaType> reader_type;
     hr = src->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                  in_video.put());
+                                  reader_type.put());
     if (FAILED(hr)) {
         set_status("Source video type unavailable");
         log::err("Exporter: GetCurrentMediaType(video) hr=0x%08lx", (long)hr);
         ::MFShutdown();
         return;
     }
+    UINT32 reader_stride_u = UINT32(src_w);   // NV12 default stride = width
+    reader_type->GetUINT32(MF_MT_DEFAULT_STRIDE, &reader_stride_u);
+
+    ComPtr<IMFMediaType> in_video;
+    ::MFCreateMediaType(in_video.put());
+    in_video->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+    in_video->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12);
+    in_video->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+    in_video->SetUINT32(MF_MT_DEFAULT_STRIDE, reader_stride_u);
+    ::MFSetAttributeSize (in_video.get(), MF_MT_FRAME_SIZE,  src_w,   src_h);
+    ::MFSetAttributeRatio(in_video.get(), MF_MT_FRAME_RATE,  fps_num, fps_den);
+    ::MFSetAttributeRatio(in_video.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+
     hr = sw->SetInputMediaType(video_idx, in_video.get(), nullptr);
     if (FAILED(hr)) {
         set_status("Encoder rejected source video format");
@@ -278,6 +307,8 @@ void Exporter::run_one_export(ExportRequest req) {
         ::MFShutdown();
         return;
     }
+    log::info("Exporter: input video set to NV12 %ux%u stride=%u @ %u/%u fps",
+              src_w, src_h, reader_stride_u, fps_num, fps_den);
 
     // Audio.
     DWORD audio_idx = (DWORD)-1;

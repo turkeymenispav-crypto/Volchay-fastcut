@@ -351,9 +351,20 @@ void MfPlayer::worker_release_reader() {
 bool MfPlayer::worker_create_reader(const std::wstring& path) {
     auto try_open = [&](bool with_dxva) -> bool {
         ComPtr<IMFAttributes> attrs;
-        if (FAILED(::MFCreateAttributes(attrs.put(), 6))) return false;
+        if (FAILED(::MFCreateAttributes(attrs.put(), 8))) return false;
 
+        // ENABLE_ADVANCED_VIDEO_PROCESSING is what makes Media Foundation
+        // insert a Color Converter MFT for AV1 / 10-bit HEVC sources.
+        // Without it the source reader can't satisfy a SetCurrentMediaType
+        // request for RGB32 (or even NV12) on AV1 because the AV1 decoder
+        // outputs P010 natively and won't auto-convert.
         attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
+        // MinGW's mfreadwrite.h doesn't expose this attribute even though
+        // it's been in the Windows SDK since Win8. The GUID is stable.
+        static const GUID kMfReaderAdvancedVideoProcessing = {
+            0x0f81da2c, 0xb537, 0x4672,
+            { 0xa8, 0xb2, 0xa6, 0x81, 0xb1, 0x73, 0x07, 0xa3 } };
+        attrs->SetUINT32(kMfReaderAdvancedVideoProcessing, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
 
         if (with_dxva && device_) {
@@ -420,20 +431,27 @@ bool MfPlayer::worker_configure_output_format() {
         return true;
     };
 
-    if (!try_set(MFVideoFormat_RGB32)) {
+    convert_nv12_ = false;
+    bool got_format = try_set(MFVideoFormat_RGB32);
+    if (!got_format) {
         log::warn("RGB32 output unavailable on current reader; "
                   "rebuilding reader in software mode");
         reader_.reset();
         dxgi_manager_.reset();
         hardware_decode_.store(false);
-        // Reuse the same path stored on the UI side. This worker is the
-        // only thread that touches reader_, so it's safe to call
-        // worker_create_reader here.
         if (!worker_create_reader(source_path_)) return false;
-        if (!try_set(MFVideoFormat_RGB32)) {
-            log::err("RGB32 output unavailable even on SW reader");
+        got_format = try_set(MFVideoFormat_RGB32);
+    }
+    if (!got_format) {
+        // Last resort for sources whose decoder + MF can't produce RGB32
+        // (typical AV1 path on some systems): take NV12 and do the
+        // YUV->BGRA conversion ourselves on the worker thread.
+        log::warn("RGB32 unavailable; falling back to NV12 + manual conversion");
+        if (!try_set(MFVideoFormat_NV12)) {
+            log::err("Neither RGB32 nor NV12 available on reader");
             return false;
         }
+        convert_nv12_ = true;
     }
 
     ComPtr<IMFMediaType> got;
@@ -532,20 +550,53 @@ bool MfPlayer::worker_decode_one(core::TimeUs target_us) {
         }
 
         // Copy into shared_buf_ honouring (possibly negative) MF stride.
+        // shared_buf_ always holds BGRA32 — for NV12 sources we run a
+        // YUV->BGRA conversion (BT.709 limited range, the common case
+        // for HD+ video; close-enough for full range too).
         {
             std::lock_guard lk(buf_mu_);
             const int w = shared_buf_w_;
             const int h = shared_buf_h_;
-            const LONG src_stride = stride_ != 0 ? stride_ : LONG(w) * 4;
-            const BYTE* src = data;
-            const bool flip = src_stride < 0;
-            const LONG row  = flip ? -src_stride : src_stride;
-            if (flip) src = data + LONG(h - 1) * row;
-            const size_t row_bytes = size_t(w) * 4;
             unsigned char* dst = shared_buf_.data();
-            for (int y = 0; y < h; ++y) {
-                std::memcpy(dst + size_t(y) * row_bytes, src, row_bytes);
-                src = flip ? src - row : src + row;
+            const size_t   row_bytes = size_t(w) * 4;
+
+            if (convert_nv12_) {
+                const LONG y_stride = stride_ > 0 ? stride_ : LONG(w);
+                const BYTE* y_plane  = data;
+                const BYTE* uv_plane = data + size_t(y_stride) * size_t(h);
+                for (int y = 0; y < h; ++y) {
+                    const BYTE* y_row  = y_plane  + size_t(y) * size_t(y_stride);
+                    const BYTE* uv_row = uv_plane + size_t(y / 2) * size_t(y_stride);
+                    unsigned char* d   = dst + size_t(y) * row_bytes;
+                    for (int x = 0; x < w; ++x) {
+                        const int Y = int(y_row[x]) - 16;
+                        const int U = int(uv_row[(x & ~1)])     - 128;
+                        const int V = int(uv_row[(x & ~1) + 1]) - 128;
+                        // BT.709 limited-range, fixed-point (×256).
+                        const int c = 298 * Y;
+                        int r = (c + 459 * V + 128) >> 8;
+                        int g = (c -  55 * U - 136 * V + 128) >> 8;
+                        int b = (c + 541 * U + 128) >> 8;
+                        if (r < 0) r = 0; else if (r > 255) r = 255;
+                        if (g < 0) g = 0; else if (g > 255) g = 255;
+                        if (b < 0) b = 0; else if (b > 255) b = 255;
+                        d[0] = (unsigned char)b;
+                        d[1] = (unsigned char)g;
+                        d[2] = (unsigned char)r;
+                        d[3] = 255;
+                        d += 4;
+                    }
+                }
+            } else {
+                const LONG src_stride = stride_ != 0 ? stride_ : LONG(w) * 4;
+                const BYTE* src = data;
+                const bool flip = src_stride < 0;
+                const LONG row  = flip ? -src_stride : src_stride;
+                if (flip) src = data + LONG(h - 1) * row;
+                for (int y = 0; y < h; ++y) {
+                    std::memcpy(dst + size_t(y) * row_bytes, src, row_bytes);
+                    src = flip ? src - row : src + row;
+                }
             }
             shared_buf_pts_ = pts;
         }

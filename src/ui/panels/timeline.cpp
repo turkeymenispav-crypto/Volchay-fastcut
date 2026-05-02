@@ -37,6 +37,12 @@ void draw_timeline(EditorContext& ctx) {
     static int          trim_side       = 0;   // -1 left, +1 right, 0 none
     static core::TimeUs trim_initial_x  = 0;   // initial timeline coordinate
     static core::TimeUs trim_initial_v  = 0;
+    // Per-frame drag state for moving clips along the timeline.
+    static std::string  move_clip_id;
+    static float        move_initial_mouse_x = 0.f;
+    static core::TimeUs move_initial_t_in    = 0;
+    static bool         move_did_drag        = false;
+    static bool         move_pushed_undo     = false;
 
     ImGui::Begin("Timeline");
 
@@ -45,9 +51,19 @@ void draw_timeline(EditorContext& ctx) {
     auto* player  = ctx.player;
     auto* audio   = ctx.audio;
 
+    // The audio engine + video player both speak FILE PTS, but `t` here
+    // is the project's TIMELINE PTS. Translate via the clip that covers
+    // the playhead so that trim_in / split / multi-clip layouts (where
+    // timeline_pts != file_pts) seek the source to the right place.
     auto sync_player_seek = [&](core::TimeUs t) {
-        if (player) player->seek(t);
-        if (audio)  audio->seek(t);
+        core::TimeUs file_t = project->source_time_at(t);
+        if (file_t < 0) {
+            // Outside any clip — fall back to t. The player will clamp
+            // negative values internally.
+            file_t = t;
+        }
+        if (player) player->seek(file_t);
+        if (audio)  audio->seek(file_t);
     };
 
     // Transport bar.
@@ -241,12 +257,21 @@ void draw_timeline(EditorContext& ctx) {
                                           * us_per_px(zoom));
             trim_initial_v = (trim_side == -1) ? clip.t_in : clip.t_out();
         }
-        // Click-to-select (consumed only if no trim drag started).
+        // Click on the clip body: select AND arm a move-drag. The actual
+        // move only commits if the mouse moves more than a few pixels;
+        // a pure click stays a select.
         if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && inside &&
-            !over_left && !over_right) {
+            !over_left && !over_right && trim_clip_id.empty() &&
+            move_clip_id.empty()) {
             if (!io.KeyCtrl) project->clear_selection();
-            clip.selected = !clip.selected || !io.KeyCtrl;
             if (io.KeyCtrl) clip.selected = !clip.selected;
+            else            clip.selected = true;
+
+            move_clip_id         = clip.id;
+            move_initial_mouse_x = mouse.x;
+            move_initial_t_in    = clip.t_in;
+            move_did_drag        = false;
+            move_pushed_undo     = false;
         }
 
         // Draw handles for visual feedback.
@@ -270,9 +295,55 @@ void draw_timeline(EditorContext& ctx) {
             } else if (trim_side == +1) {
                 project->trim_out(trim_clip_id, trim_initial_v + delta);
             }
+            // Snap audio/video to the new clip extents so the preview
+            // doesn't keep playing the pre-trim region (most visible
+            // when the user drags the left handle while paused — the
+            // audio engine is otherwise free-running from its old PTS).
+            const auto& cs = project->clips();
+            for (const auto& cc : cs) {
+                if (cc.id == trim_clip_id) {
+                    if (trim_side == -1) {
+                        project->set_playhead(cc.t_in);
+                    }
+                    sync_player_seek(project->playhead());
+                    break;
+                }
+            }
         } else {
             trim_clip_id.clear();
             trim_side = 0;
+        }
+    }
+
+    // Active drag-move (translate clip along the timeline).
+    if (!move_clip_id.empty()) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            const float dx_px = io.MousePos.x - move_initial_mouse_x;
+            // Use a small threshold so a plain click doesn't shift the
+            // clip by accident.
+            if (!move_did_drag && std::fabs(dx_px) >= 3.0f) {
+                move_did_drag    = true;
+                if (!move_pushed_undo) {
+                    project->push_undo();
+                    move_pushed_undo = true;
+                }
+            }
+            if (move_did_drag) {
+                core::TimeUs dt = core::TimeUs(double(dx_px) * us_per_px(zoom));
+                core::TimeUs new_t_in = move_initial_t_in + dt;
+                if (new_t_in < 0) new_t_in = 0;
+                for (auto& cc : clips) {
+                    if (cc.id == move_clip_id) {
+                        cc.t_in = new_t_in;
+                        project->mark_dirty();
+                        break;
+                    }
+                }
+            }
+        } else {
+            move_clip_id.clear();
+            move_did_drag    = false;
+            move_pushed_undo = false;
         }
     }
 
@@ -293,7 +364,7 @@ void draw_timeline(EditorContext& ctx) {
     ImGui::SetCursorScreenPos(c);
     ImGui::InvisibleButton("##timeline_seek",
                            ImVec2(total_w, ruler_h + track_h + 8.f));
-    if (ImGui::IsItemActive() && trim_clip_id.empty()) {
+    if (ImGui::IsItemActive() && trim_clip_id.empty() && move_clip_id.empty()) {
         const ImVec2 m = io.MousePos;
         const double t_us = double(m.x - c.x) * us_per_px(zoom);
         core::TimeUs nt = core::TimeUs(std::max(0.0, t_us));

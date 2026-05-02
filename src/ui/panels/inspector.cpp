@@ -1,5 +1,7 @@
 #include "ui/panels/inspector.h"
 
+#include "media/audio_player.h"
+#include "media/mf_player.h"
 #include "ui/main_layout.h"
 #include "ui/theme.h"
 
@@ -29,13 +31,29 @@ void draw_inspector(EditorContext& ctx) {
     float in_s  = float(core::to_seconds(clip.src_in));
     float out_s = float(core::to_seconds(clip.src_out));
 
+    auto resync_to_playhead = [&]() {
+        // After src_in/src_out change, snap the audio + video back to the
+        // file PTS that corresponds to the current timeline playhead.
+        // Otherwise the audio engine keeps playing from wherever it was
+        // before the trim, which the user perceives as "audio playing
+        // from the beginning even though I trimmed the clip".
+        if (!ctx.project) return;
+        const core::TimeUs ph = ctx.project->playhead();
+        core::TimeUs file_t = ctx.project->source_time_at(ph);
+        if (file_t < 0) file_t = clip.src_in;
+        if (ctx.player) ctx.player->seek(file_t);
+        if (ctx.audio)  ctx.audio->seek(file_t);
+    };
+
     if (ImGui::DragFloat("In",  &in_s,  0.05f, 0.0f, out_s, "%.3f s")) {
         clip.src_in = core::from_seconds(in_s);
         ctx.project->mark_dirty();
+        resync_to_playhead();
     }
     if (ImGui::DragFloat("Out", &out_s, 0.05f, in_s, 1e6f, "%.3f s")) {
         clip.src_out = core::from_seconds(out_s);
         ctx.project->mark_dirty();
+        resync_to_playhead();
     }
 
     ImGui::Spacing();

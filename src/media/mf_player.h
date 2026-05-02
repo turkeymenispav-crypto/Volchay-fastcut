@@ -115,6 +115,10 @@ private:
     LONG                              stride_ = 0;
     core::TimeUs                      pending_seek_ = -1;
     core::TimeUs                      worker_pts_   = -1;
+    // True if the source reader output is NV12 and we have to convert it
+    // to BGRA on the worker thread (fallback for AV1 / decoder paths
+    // where MF refuses to give us RGB32 even with advanced processing).
+    bool                              convert_nv12_ = false;
 
     // D3D11 (device + texture are thread-safe to create; ImmediateContext
     // is UI-thread only). Texture and SRV are created on the worker after
