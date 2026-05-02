@@ -1,34 +1,51 @@
+// libavformat / libavcodec / libswscale-based video player.
+// (File name kept for source-compat with the previous Media Foundation
+// implementation; the class is still called MfPlayer.)
 #include "media/mf_player.h"
 
 #include "util/log.h"
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/rational.h>
+#include <libswscale/swscale.h>
+}
+
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string>
 
 namespace volchay::media {
 namespace {
 
-std::atomic<bool> g_mf_started{false};
-
-constexpr LONGLONG us_to_mftime(core::TimeUs us) {
-    return LONGLONG(us) * 10;
+core::TimeUs av_to_us(int64_t pts, AVRational tb) {
+    if (pts == AV_NOPTS_VALUE) return 0;
+    return core::TimeUs(av_rescale_q(pts, tb, AVRational{1, 1'000'000}));
 }
 
-constexpr core::TimeUs mftime_to_us(LONGLONG t) {
-    return core::TimeUs(t / 10);
+int64_t us_to_av(core::TimeUs us, AVRational tb) {
+    return av_rescale_q(int64_t(us), AVRational{1, 1'000'000}, tb);
 }
 
-const char* hr_name(HRESULT hr) {
-    switch (hr) {
-    case MF_E_INVALIDMEDIATYPE: return "MF_E_INVALIDMEDIATYPE";
-    case MF_E_TOPO_CODEC_NOT_FOUND: return "MF_E_TOPO_CODEC_NOT_FOUND";
-    case MF_E_UNSUPPORTED_BYTESTREAM_TYPE: return "MF_E_UNSUPPORTED_BYTESTREAM_TYPE";
-    case E_INVALIDARG: return "E_INVALIDARG";
-    case E_NOTIMPL:    return "E_NOTIMPL";
-    case E_FAIL:       return "E_FAIL";
-    default: return "?";
-    }
+std::string averr(int err) {
+    char buf[AV_ERROR_MAX_STRING_SIZE]{};
+    av_strerror(err, buf, sizeof(buf));
+    return std::string(buf);
+}
+
+std::string narrow_path(const std::wstring& w) {
+    int sz = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()),
+                                   nullptr, 0, nullptr, nullptr);
+    std::string out(sz, 0);
+    ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()),
+                          out.data(), sz, nullptr, nullptr);
+    return out;
 }
 
 }  // namespace
@@ -47,21 +64,6 @@ MfPlayer::~MfPlayer() {
     if (worker_.joinable()) worker_.join();
 }
 
-bool MfPlayer::ensure_started() {
-    bool expected = false;
-    if (!g_mf_started.compare_exchange_strong(expected, true)) {
-        return true;
-    }
-    HRESULT hr = ::MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    if (FAILED(hr)) {
-        log::err("MFStartup failed 0x%08lx (%s)", long(hr), hr_name(hr));
-        g_mf_started.store(false);
-        return false;
-    }
-    log::info("Media Foundation started (MF_VERSION=0x%x)", (unsigned)MF_VERSION);
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 // UI thread API
 // ---------------------------------------------------------------------------
@@ -69,8 +71,7 @@ bool MfPlayer::ensure_started() {
 bool MfPlayer::open(const std::wstring& path, ID3D11Device* device) {
     if (!device) return false;
 
-    // Tear down any previous open synchronously (so the worker is idle
-    // before we hand it a new request).
+    // Tear down any previous open synchronously.
     {
         std::lock_guard lk(mu_);
         close_request_pending_ = true;
@@ -96,13 +97,8 @@ bool MfPlayer::open(const std::wstring& path, ID3D11Device* device) {
     }
     cv_.notify_all();
 
-    // Block on the metadata-probe phase only. The slow part — decoder
-    // init for HEVC/4K — happens here on the worker, but the UI thread
-    // call site needs duration/width/height available the moment
-    // open() returns (project.add_media + set_single_clip read them
-    // synchronously). The first frame decode that follows is what we
-    // really want off the UI thread, and that runs asynchronously now.
-    // Cap at 5 s so a hung decoder can't permanently freeze the UI.
+    // Block on metadata-probe phase. 5 s deadline so a hung decoder
+    // can't permanently freeze the UI.
     const auto deadline = std::chrono::steady_clock::now()
                         + std::chrono::seconds(5);
     while (!open_done_.load()
@@ -118,11 +114,9 @@ void MfPlayer::close() {
         close_request_pending_ = true;
     }
     cv_.notify_all();
-    // Wait for the worker to actually release the reader.
     for (int i = 0; i < 1000 && reader_open_.load(); ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    // UI-side state.
     srv_.reset();
     texture_.reset();
     context_.reset();
@@ -152,23 +146,15 @@ void MfPlayer::seek(core::TimeUs t) {
     seek_target_.store(t);
     target_pts_.store(t);
     decode_kick_.store(true);
-    // Pre-emptively reflect the seek on current_pts_ — without this the
-    // viewer briefly shows a stale frame's PTS until the worker decodes
-    // the new one.
     current_pts_.store(t);
     cv_.notify_all();
 }
 
 bool MfPlayer::pump(core::TimeUs playhead_us) {
     if (!reader_open_.load()) return false;
-
-    // Tell the worker how far ahead we want frames to be ready. This is
-    // also how the worker knows we're "playing forward" — when target_pts
-    // moves past current_pts the worker decodes the next frame.
     target_pts_.store(playhead_us);
 
     bool uploaded = false;
-
     if (frame_ready_.exchange(false)) {
         std::lock_guard lk(buf_mu_);
         if (!shared_buf_.empty() && texture_ && context_) {
@@ -193,7 +179,6 @@ bool MfPlayer::pump(core::TimeUs playhead_us) {
         }
     }
 
-    // Decide whether to ask the worker for another frame.
     const core::TimeUs cur = current_pts_.load();
     const double      f   = fps_.load();
     const core::TimeUs frame_time = (f > 0.0)
@@ -212,9 +197,6 @@ bool MfPlayer::pump(core::TimeUs playhead_us) {
 // ---------------------------------------------------------------------------
 
 void MfPlayer::worker_main() {
-    HRESULT init = ::CoInitializeEx(nullptr,
-                                    COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
-
     while (!quit_.load()) {
         bool         do_open  = false;
         bool         do_close = false;
@@ -240,16 +222,14 @@ void MfPlayer::worker_main() {
         }
 
         if (do_close) {
-            worker_release_reader();
+            worker_release_decoder();
         }
         if (do_open) {
-            // close any still-live previous reader
-            worker_release_reader();
+            worker_release_decoder();
             if (!worker_open(path)) {
-                log::err("MfPlayer worker: open failed");
-                worker_release_reader();
+                log::err("FFmpeg worker: open failed");
+                worker_release_decoder();
             }
-            // Either path: signal completion to the UI thread.
             open_done_.store(true);
         }
 
@@ -257,42 +237,125 @@ void MfPlayer::worker_main() {
 
         // Apply pending seek before decode.
         const core::TimeUs seek = seek_target_.exchange(-1);
-        if (seek >= 0 && reader_) {
-            PROPVARIANT pv;
-            ::PropVariantInit(&pv);
-            pv.vt = VT_I8;
-            pv.hVal.QuadPart = us_to_mftime(seek);
-            reader_->SetCurrentPosition(GUID_NULL, pv);
-            ::PropVariantClear(&pv);
-            pending_seek_ = seek;
-            worker_pts_   = -1;
+        if (seek >= 0 && fmt_ctx_) {
+            AVStream* st = fmt_ctx_->streams[video_stream_];
+            int64_t target_ts = us_to_av(seek, st->time_base) + ts_offset_;
+            int err = av_seek_frame(fmt_ctx_, video_stream_, target_ts,
+                                    AVSEEK_FLAG_BACKWARD);
+            if (err < 0) {
+                log::warn("av_seek_frame: %s", averr(err).c_str());
+            }
+            avcodec_flush_buffers(codec_ctx_);
+            worker_pts_ = -1;
         }
 
-        // Decode at most one frame per signal — UI re-kicks us when it
-        // wants the next one. This caps decode work to the actual
-        // display rate without ever doing it on the UI thread.
         if (decode_kick_.exchange(false)) {
             const core::TimeUs target = target_pts_.load();
             worker_decode_one(target);
         }
     }
 
-    worker_release_reader();
-    if (SUCCEEDED(init)) ::CoUninitialize();
+    worker_release_decoder();
 }
 
 bool MfPlayer::worker_open(const std::wstring& path) {
-    if (!ensure_started())  return false;
-    if (!device_)           return false;
+    if (!device_) return false;
 
-    if (!worker_create_reader(path))         return false;
-    if (!worker_configure_output_format())   return false;
+    const std::string utf8_path = narrow_path(path);
 
-    // Create the dynamic texture. ID3D11Device::CreateTexture2D /
-    // CreateShaderResourceView are thread-safe in default (non-singlethreaded)
-    // device creation mode, which D3DContext uses.
-    const int w = width_.load();
-    const int h = height_.load();
+    AVFormatContext* fmt = nullptr;
+    int err = avformat_open_input(&fmt, utf8_path.c_str(), nullptr, nullptr);
+    if (err < 0) {
+        log::err("avformat_open_input: %s", averr(err).c_str());
+        return false;
+    }
+    fmt_ctx_ = fmt;
+
+    err = avformat_find_stream_info(fmt_ctx_, nullptr);
+    if (err < 0) {
+        log::err("avformat_find_stream_info: %s", averr(err).c_str());
+        return false;
+    }
+
+    int vstream = av_find_best_stream(fmt_ctx_, AVMEDIA_TYPE_VIDEO,
+                                      -1, -1, nullptr, 0);
+    if (vstream < 0) {
+        log::err("No video stream found");
+        return false;
+    }
+    video_stream_ = vstream;
+    AVStream* st = fmt_ctx_->streams[video_stream_];
+
+    const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!dec) {
+        log::err("No decoder for codec id %d", int(st->codecpar->codec_id));
+        return false;
+    }
+    codec_ctx_ = avcodec_alloc_context3(dec);
+    if (!codec_ctx_) return false;
+    err = avcodec_parameters_to_context(codec_ctx_, st->codecpar);
+    if (err < 0) {
+        log::err("avcodec_parameters_to_context: %s", averr(err).c_str());
+        return false;
+    }
+    codec_ctx_->thread_count = 0;  // auto: ~ncpu
+    codec_ctx_->thread_type  = FF_THREAD_FRAME | FF_THREAD_SLICE;
+
+    err = avcodec_open2(codec_ctx_, dec, nullptr);
+    if (err < 0) {
+        log::err("avcodec_open2: %s", averr(err).c_str());
+        return false;
+    }
+
+    int w = codec_ctx_->width;
+    int h = codec_ctx_->height;
+    if (w <= 0 || h <= 0) {
+        log::err("Decoder reports zero dimensions");
+        return false;
+    }
+    width_.store(w);
+    height_.store(h);
+
+    AVRational fr = av_guess_frame_rate(fmt_ctx_, st, nullptr);
+    double fps = (fr.den != 0) ? (double(fr.num) / double(fr.den)) : 0.0;
+    if (fps <= 0.0 && st->avg_frame_rate.den != 0) {
+        fps = double(st->avg_frame_rate.num) / double(st->avg_frame_rate.den);
+    }
+    if (fps <= 0.0) fps = 30.0;
+    fps_.store(fps);
+
+    int64_t dur = 0;
+    if (st->duration != AV_NOPTS_VALUE && st->duration > 0) {
+        dur = av_rescale_q(st->duration, st->time_base,
+                           AVRational{1, 1'000'000});
+    } else if (fmt_ctx_->duration != AV_NOPTS_VALUE) {
+        dur = av_rescale_q(fmt_ctx_->duration, AVRational{1, AV_TIME_BASE},
+                           AVRational{1, 1'000'000});
+    }
+    duration_.store(core::TimeUs(dur));
+
+    // Some formats start at non-zero PTS (e.g. transport streams);
+    // remember the offset so seek/clock report time-from-start.
+    ts_offset_ = (st->start_time != AV_NOPTS_VALUE) ? st->start_time : 0;
+
+    // Allocate reusable packet/frame and the BGRA scaler.
+    packet_ = av_packet_alloc();
+    frame_  = av_frame_alloc();
+    if (!packet_ || !frame_) return false;
+
+    sws_ctx_ = sws_getContext(
+        w, h, codec_ctx_->pix_fmt,
+        w, h, AV_PIX_FMT_BGRA,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
+    if (!sws_ctx_) {
+        log::err("sws_getContext failed for src fmt %d (%s)",
+                 int(codec_ctx_->pix_fmt),
+                 av_get_pix_fmt_name(codec_ctx_->pix_fmt)
+                    ? av_get_pix_fmt_name(codec_ctx_->pix_fmt) : "?");
+        return false;
+    }
+
+    // Create the dynamic texture.
     D3D11_TEXTURE2D_DESC td{};
     td.Width            = UINT(w);
     td.Height           = UINT(h);
@@ -327,304 +390,130 @@ bool MfPlayer::worker_open(const std::wstring& path) {
         shared_buf_pts_ = -1;
     }
     frame_ready_.store(false);
-    pending_seek_ = -1;
-    worker_pts_   = -1;
+    worker_pts_ = -1;
 
+    log::info("FF stream: %dx%d @ %.3f fps, codec %s, pix_fmt %s, duration %.3fs",
+              w, h, fps, dec->name,
+              av_get_pix_fmt_name(codec_ctx_->pix_fmt)
+                ? av_get_pix_fmt_name(codec_ctx_->pix_fmt) : "?",
+              double(dur) / 1'000'000.0);
     log::info("Video texture ready: %dx%d BGRA8 (dynamic)", w, h);
     reader_open_.store(true);
     return true;
 }
 
-void MfPlayer::worker_release_reader() {
+void MfPlayer::worker_release_decoder() {
     reader_open_.store(false);
-    reader_.reset();
-    dxgi_manager_.reset();
+    if (sws_ctx_)   { sws_freeContext(sws_ctx_); sws_ctx_ = nullptr; }
+    if (frame_)     { av_frame_free(&frame_);    frame_   = nullptr; }
+    if (packet_)    { av_packet_free(&packet_);  packet_  = nullptr; }
+    if (codec_ctx_) { avcodec_free_context(&codec_ctx_);              }
+    if (fmt_ctx_)   { avformat_close_input(&fmt_ctx_);                }
+    video_stream_ = -1;
     width_.store(0);
     height_.store(0);
     fps_.store(0.0);
     duration_.store(0);
     hardware_decode_.store(false);
-    pending_seek_ = -1;
-    worker_pts_   = -1;
-}
-
-bool MfPlayer::worker_create_reader(const std::wstring& path) {
-    auto try_open = [&](bool with_dxva) -> bool {
-        ComPtr<IMFAttributes> attrs;
-        if (FAILED(::MFCreateAttributes(attrs.put(), 6))) return false;
-
-        // We deliberately do NOT set MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING
-        // here: on at least some Windows 11 + GPU driver combinations
-        // (confirmed against an AV1 .mp4 from Xbox Game DVR) it makes
-        // MFCreateSourceReaderFromURL itself fail with E_INVALIDARG.
-        // Basic ENABLE_VIDEO_PROCESSING + the NV12 fallback in
-        // worker_configure_output_format is enough.
-        attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-        attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
-
-        if (with_dxva && device_) {
-            UINT reset_token = 0;
-            ComPtr<IMFDXGIDeviceManager> mgr;
-            HRESULT hr = ::MFCreateDXGIDeviceManager(&reset_token, mgr.put());
-            if (SUCCEEDED(hr) && SUCCEEDED(mgr->ResetDevice(device_.get(),
-                                                            reset_token))) {
-                attrs->SetUnknown(MF_SOURCE_READER_D3D_MANAGER, mgr.get());
-                attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, FALSE);
-                dxgi_manager_ = mgr;
-            } else {
-                log::warn("MFCreateDXGIDeviceManager/ResetDevice 0x%08lx",
-                          long(hr));
-                return false;
-            }
-        } else {
-            attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, TRUE);
-        }
-
-        ComPtr<IMFSourceReader> r;
-        HRESULT hr = ::MFCreateSourceReaderFromURL(path.c_str(), attrs.get(),
-                                                   r.put());
-        if (FAILED(hr)) {
-            log::warn("MFCreateSourceReaderFromURL(%s) 0x%08lx (%s)",
-                      with_dxva ? "HW" : "SW", long(hr), hr_name(hr));
-            dxgi_manager_.reset();
-            return false;
-        }
-        r->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-        r->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-        reader_ = r;
-        hardware_decode_.store(with_dxva);
-        return true;
-    };
-
-    hardware_decode_.store(false);
-    if (prefer_hardware_.load() && device_ && try_open(/*with_dxva=*/true)) {
-        log::info("MF: source reader opened (DXVA hardware decode)");
-        return true;
-    }
-    if (!try_open(/*with_dxva=*/false)) {
-        log::err("MF: software open also failed");
-        return false;
-    }
-    log::info("MF: source reader opened (software decode)");
-    return true;
-}
-
-bool MfPlayer::worker_configure_output_format() {
-    if (!reader_) return false;
-
-    auto try_set = [&](const GUID& subtype) -> bool {
-        ComPtr<IMFMediaType> out_type;
-        if (FAILED(::MFCreateMediaType(out_type.put()))) return false;
-        out_type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        out_type->SetGUID(MF_MT_SUBTYPE,    subtype);
-        HRESULT hr = reader_->SetCurrentMediaType(
-            MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, out_type.get());
-        if (FAILED(hr)) {
-            log::warn("SetCurrentMediaType 0x%08lx", long(hr));
-            return false;
-        }
-        return true;
-    };
-
-    convert_nv12_ = false;
-    bool got_format = try_set(MFVideoFormat_RGB32);
-    if (!got_format) {
-        log::warn("RGB32 output unavailable on current reader; "
-                  "rebuilding reader in software mode");
-        reader_.reset();
-        dxgi_manager_.reset();
-        hardware_decode_.store(false);
-        if (!worker_create_reader(source_path_)) return false;
-        got_format = try_set(MFVideoFormat_RGB32);
-    }
-    if (!got_format) {
-        // Last resort for sources whose decoder + MF can't produce RGB32
-        // (typical AV1 path on some systems): take NV12 and do the
-        // YUV->BGRA conversion ourselves on the worker thread.
-        log::warn("RGB32 unavailable; falling back to NV12 + manual conversion");
-        if (!try_set(MFVideoFormat_NV12)) {
-            log::err("Neither RGB32 nor NV12 available on reader");
-            return false;
-        }
-        convert_nv12_ = true;
-    }
-
-    ComPtr<IMFMediaType> got;
-    if (FAILED(reader_->GetCurrentMediaType(
-            MF_SOURCE_READER_FIRST_VIDEO_STREAM, got.put()))) {
-        return false;
-    }
-
-    UINT32 w = 0, h = 0;
-    ::MFGetAttributeSize(got.get(), MF_MT_FRAME_SIZE, &w, &h);
-    width_.store(int(w));
-    height_.store(int(h));
-
-    UINT32 num = 0, den = 0;
-    if (SUCCEEDED(::MFGetAttributeRatio(got.get(), MF_MT_FRAME_RATE, &num, &den))
-        && den != 0) {
-        fps_.store(double(num) / double(den));
-    }
-
-    LONG stride = 0;
-    if (SUCCEEDED(got->GetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32*)&stride))) {
-        stride_ = stride;
-    } else {
-        stride_ = LONG(int(w)) * 4;
-    }
-
-    PROPVARIANT pv;
-    ::PropVariantInit(&pv);
-    if (SUCCEEDED(reader_->GetPresentationAttribute(
-            MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))) {
-        if (pv.vt == VT_UI8) {
-            duration_.store(mftime_to_us((LONGLONG)pv.uhVal.QuadPart));
-        }
-    }
-    ::PropVariantClear(&pv);
-
-    log::info("MF stream: %dx%d @ %.3f fps, stride %ld, duration %.3fs (%s)",
-              int(w), int(h), fps_.load(), long(stride_),
-              core::to_seconds(duration_.load()),
-              hardware_decode_.load() ? "HW decode" : "SW decode");
-    return w > 0 && h > 0;
+    worker_pts_ = -1;
+    ts_offset_  = 0;
 }
 
 bool MfPlayer::worker_decode_one(core::TimeUs target_us) {
-    if (!reader_) return false;
+    if (!fmt_ctx_ || !codec_ctx_ || !packet_ || !frame_ || !sws_ctx_)
+        return false;
+
+    AVStream* st = fmt_ctx_->streams[video_stream_];
 
     int sample_count = 0;
     while (true) {
-        if (++sample_count > 64) {
-            log::warn("worker_decode_one: 64 reads without a sample — bailing");
+        if (++sample_count > 256) {
+            log::warn("worker_decode_one: 256 packets without a frame — bailing");
             return false;
         }
-        DWORD       stream_index = 0;
-        DWORD       flags        = 0;
-        LONGLONG    timestamp_mf = 0;
-        ComPtr<IMFSample> sample;
 
-        HRESULT hr = reader_->ReadSample(
-            MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
-            &stream_index, &flags, &timestamp_mf, sample.put());
-        if (FAILED(hr)) {
-            log::err("ReadSample 0x%08lx (%s)", long(hr), hr_name(hr));
-            return false;
-        }
-        if (flags & MF_SOURCE_READERF_ERROR) {
-            log::err("ReadSample reported MF_SOURCE_READERF_ERROR");
-            return false;
-        }
-        if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
-            log::info("ReadSample: end of stream");
-            return false;
-        }
-        if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
-            // Just refresh stride/dims/fps. Calling SetCurrentMediaType
-            // again here would re-trigger CURRENTMEDIATYPECHANGED on the
-            // very next ReadSample, looping forever.
-            ComPtr<IMFMediaType> got;
-            if (SUCCEEDED(reader_->GetCurrentMediaType(
-                    MF_SOURCE_READER_FIRST_VIDEO_STREAM, got.put()))) {
-                UINT32 w2 = 0, h2 = 0;
-                ::MFGetAttributeSize(got.get(), MF_MT_FRAME_SIZE, &w2, &h2);
-                if (int(w2) == width_.load() && int(h2) == height_.load()) {
-                    LONG s2 = 0;
-                    if (SUCCEEDED(got->GetUINT32(MF_MT_DEFAULT_STRIDE,
-                                                 (UINT32*)&s2))) {
-                        stride_ = s2;
-                    }
-                } else {
-                    log::warn("ReadSample: frame size changed %dx%d -> %ux%u; "
-                              "reconfiguring",
-                              width_.load(), height_.load(),
-                              (unsigned)w2, (unsigned)h2);
-                    worker_configure_output_format();
-                }
+        // First try draining decoder output.
+        int err = avcodec_receive_frame(codec_ctx_, frame_);
+        if (err == 0) {
+            // Got a frame.
+            int64_t pts_ts = (frame_->best_effort_timestamp != AV_NOPTS_VALUE)
+                ? frame_->best_effort_timestamp
+                : frame_->pts;
+            if (pts_ts == AV_NOPTS_VALUE) pts_ts = ts_offset_;
+            const core::TimeUs pts =
+                av_to_us(pts_ts - ts_offset_, st->time_base);
+
+            // Drop frames that are well behind the playhead so we can
+            // catch up after a seek without freezing the UI on each one.
+            const double f = fps_.load();
+            if (f > 0.0 && pts + core::TimeUs(1'000'000.0 / f) < target_us
+                && worker_pts_ >= 0) {
+                av_frame_unref(frame_);
+                continue;
             }
-        }
-        if (!sample) continue;  // stream tick without payload
 
-        const core::TimeUs pts = mftime_to_us(timestamp_mf);
-
-        bool keep = true;
-        const double f = fps_.load();
-        if (f > 0.0 && pts + core::TimeUs(1'000'000.0 / f) < target_us) {
-            keep = false;
-        }
-        if (!keep) continue;
-
-        ComPtr<IMFMediaBuffer> buffer;
-        if (FAILED(sample->ConvertToContiguousBuffer(buffer.put()))) {
-            continue;
-        }
-        BYTE* data = nullptr;
-        DWORD max_len = 0, cur_len = 0;
-        if (FAILED(buffer->Lock(&data, &max_len, &cur_len))) {
-            continue;
-        }
-
-        // Copy into shared_buf_ honouring (possibly negative) MF stride.
-        // shared_buf_ always holds BGRA32 — for NV12 sources we run a
-        // YUV->BGRA conversion (BT.709 limited range, the common case
-        // for HD+ video; close-enough for full range too).
-        {
-            std::lock_guard lk(buf_mu_);
+            // Convert to BGRA into the back buffer.
             const int w = shared_buf_w_;
             const int h = shared_buf_h_;
-            unsigned char* dst = shared_buf_.data();
-            const size_t   row_bytes = size_t(w) * 4;
-
-            if (convert_nv12_) {
-                const LONG y_stride = stride_ > 0 ? stride_ : LONG(w);
-                const BYTE* y_plane  = data;
-                const BYTE* uv_plane = data + size_t(y_stride) * size_t(h);
-                for (int y = 0; y < h; ++y) {
-                    const BYTE* y_row  = y_plane  + size_t(y) * size_t(y_stride);
-                    const BYTE* uv_row = uv_plane + size_t(y / 2) * size_t(y_stride);
-                    unsigned char* d   = dst + size_t(y) * row_bytes;
-                    for (int x = 0; x < w; ++x) {
-                        const int Y = int(y_row[x]) - 16;
-                        const int U = int(uv_row[(x & ~1)])     - 128;
-                        const int V = int(uv_row[(x & ~1) + 1]) - 128;
-                        // BT.709 limited-range, fixed-point (×256).
-                        const int c = 298 * Y;
-                        int r = (c + 459 * V + 128) >> 8;
-                        int g = (c -  55 * U - 136 * V + 128) >> 8;
-                        int b = (c + 541 * U + 128) >> 8;
-                        if (r < 0) r = 0; else if (r > 255) r = 255;
-                        if (g < 0) g = 0; else if (g > 255) g = 255;
-                        if (b < 0) b = 0; else if (b > 255) b = 255;
-                        d[0] = (unsigned char)b;
-                        d[1] = (unsigned char)g;
-                        d[2] = (unsigned char)r;
-                        d[3] = 255;
-                        d += 4;
-                    }
+            uint8_t* dst[4]    = { shared_buf_.data(), nullptr, nullptr, nullptr };
+            int      dst_lin[4]= { w * 4, 0, 0, 0 };
+            {
+                std::lock_guard lk(buf_mu_);
+                int got = sws_scale(sws_ctx_,
+                                    frame_->data, frame_->linesize,
+                                    0, frame_->height,
+                                    dst, dst_lin);
+                if (got <= 0) {
+                    log::warn("sws_scale produced %d rows", got);
+                    av_frame_unref(frame_);
+                    return false;
                 }
-            } else {
-                const LONG src_stride = stride_ != 0 ? stride_ : LONG(w) * 4;
-                const BYTE* src = data;
-                const bool flip = src_stride < 0;
-                const LONG row  = flip ? -src_stride : src_stride;
-                if (flip) src = data + LONG(h - 1) * row;
-                for (int y = 0; y < h; ++y) {
-                    std::memcpy(dst + size_t(y) * row_bytes, src, row_bytes);
-                    src = flip ? src - row : src + row;
-                }
+                shared_buf_pts_ = pts;
             }
-            shared_buf_pts_ = pts;
+            const bool first = (worker_pts_ < 0);
+            worker_pts_ = pts;
+            frame_ready_.store(true);
+            if (first) {
+                log::info("First frame decoded (pts=%.3fs, %dx%d, %s)",
+                          double(pts) / 1'000'000.0,
+                          w, h,
+                          codec_ctx_->codec ? codec_ctx_->codec->name : "?");
+            }
+            av_frame_unref(frame_);
+            return true;
+        }
+        if (err != AVERROR(EAGAIN) && err != AVERROR_EOF) {
+            log::warn("avcodec_receive_frame: %s", averr(err).c_str());
+            return false;
         }
 
-        buffer->Unlock();
-        if (worker_pts_ < 0) {
-            log::info("First frame decoded (pts=%.3fs, %dx%d, %s)",
-                      core::to_seconds(pts), width_.load(), height_.load(),
-                      hardware_decode_.load() ? "HW" : "SW");
+        if (err == AVERROR_EOF) {
+            log::info("Decoder reached end of stream");
+            return false;
         }
-        worker_pts_ = pts;
-        frame_ready_.store(true);
-        return true;
+
+        // Need more data — read another packet.
+        err = av_read_frame(fmt_ctx_, packet_);
+        if (err == AVERROR_EOF) {
+            // Flush.
+            avcodec_send_packet(codec_ctx_, nullptr);
+            continue;
+        }
+        if (err < 0) {
+            log::warn("av_read_frame: %s", averr(err).c_str());
+            return false;
+        }
+        if (packet_->stream_index != video_stream_) {
+            av_packet_unref(packet_);
+            continue;
+        }
+        err = avcodec_send_packet(codec_ctx_, packet_);
+        av_packet_unref(packet_);
+        if (err < 0 && err != AVERROR(EAGAIN)) {
+            log::warn("avcodec_send_packet: %s", averr(err).c_str());
+            return false;
+        }
+        // Loop back to receive_frame.
     }
 }
 
