@@ -520,8 +520,28 @@ bool MfPlayer::worker_decode_one(core::TimeUs target_us) {
             return false;
         }
         if (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED) {
-            log::info("ReadSample: media type changed mid-stream; reconfiguring");
-            worker_configure_output_format();
+            // Just refresh stride/dims/fps. Calling SetCurrentMediaType
+            // again here would re-trigger CURRENTMEDIATYPECHANGED on the
+            // very next ReadSample, looping forever.
+            ComPtr<IMFMediaType> got;
+            if (SUCCEEDED(reader_->GetCurrentMediaType(
+                    MF_SOURCE_READER_FIRST_VIDEO_STREAM, got.put()))) {
+                UINT32 w2 = 0, h2 = 0;
+                ::MFGetAttributeSize(got.get(), MF_MT_FRAME_SIZE, &w2, &h2);
+                if (int(w2) == width_.load() && int(h2) == height_.load()) {
+                    LONG s2 = 0;
+                    if (SUCCEEDED(got->GetUINT32(MF_MT_DEFAULT_STRIDE,
+                                                 (UINT32*)&s2))) {
+                        stride_ = s2;
+                    }
+                } else {
+                    log::warn("ReadSample: frame size changed %dx%d -> %ux%u; "
+                              "reconfiguring",
+                              width_.load(), height_.load(),
+                              (unsigned)w2, (unsigned)h2);
+                    worker_configure_output_format();
+                }
+            }
         }
         if (!sample) continue;  // stream tick without payload
 
