@@ -35,6 +35,11 @@ Makefile
 *.dylib
 *.ilk
 
+# ...except the vendored FFmpeg runtime + import libs.
+!third_party/ffmpeg/bin/*.dll
+!third_party/ffmpeg/lib/*.dll.a
+!third_party/ffmpeg/lib/*.lib
+
 # Logs / dumps
 *.log
 *.dmp
