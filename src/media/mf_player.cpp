@@ -351,20 +351,15 @@ void MfPlayer::worker_release_reader() {
 bool MfPlayer::worker_create_reader(const std::wstring& path) {
     auto try_open = [&](bool with_dxva) -> bool {
         ComPtr<IMFAttributes> attrs;
-        if (FAILED(::MFCreateAttributes(attrs.put(), 8))) return false;
+        if (FAILED(::MFCreateAttributes(attrs.put(), 6))) return false;
 
-        // ENABLE_ADVANCED_VIDEO_PROCESSING is what makes Media Foundation
-        // insert a Color Converter MFT for AV1 / 10-bit HEVC sources.
-        // Without it the source reader can't satisfy a SetCurrentMediaType
-        // request for RGB32 (or even NV12) on AV1 because the AV1 decoder
-        // outputs P010 natively and won't auto-convert.
+        // We deliberately do NOT set MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING
+        // here: on at least some Windows 11 + GPU driver combinations
+        // (confirmed against an AV1 .mp4 from Xbox Game DVR) it makes
+        // MFCreateSourceReaderFromURL itself fail with E_INVALIDARG.
+        // Basic ENABLE_VIDEO_PROCESSING + the NV12 fallback in
+        // worker_configure_output_format is enough.
         attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-        // MinGW's mfreadwrite.h doesn't expose this attribute even though
-        // it's been in the Windows SDK since Win8. The GUID is stable.
-        static const GUID kMfReaderAdvancedVideoProcessing = {
-            0x0f81da2c, 0xb537, 0x4672,
-            { 0xa8, 0xb2, 0xa6, 0x81, 0xb1, 0x73, 0x07, 0xa3 } };
-        attrs->SetUINT32(kMfReaderAdvancedVideoProcessing, TRUE);
         attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
 
         if (with_dxva && device_) {

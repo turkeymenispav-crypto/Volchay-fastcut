@@ -114,19 +114,11 @@ void Exporter::run_one_export(ExportRequest req) {
     // MF picks the GPU-resident H.264/HEVC decoder MFT when one is
     // available — on a 4060 that means NVDEC for input.
     ComPtr<IMFAttributes> src_attrs;
-    ::MFCreateAttributes(src_attrs.put(), 5);
-    // Enable both basic and advanced video processing. The advanced flag
-    // is what makes Media Foundation insert a Color Converter MFT for
-    // AV1 / 10-bit HEVC sources whose decoder output is P010 — without
-    // it the source reader silently keeps the decoder's native type and
-    // the H.264/HEVC encoder rejects every WriteSample with E_INVALIDARG.
+    ::MFCreateAttributes(src_attrs.put(), 4);
+    // Match the player: do NOT set ENABLE_ADVANCED_VIDEO_PROCESSING.
+    // It's been observed to make MFCreateSourceReaderFromURL fail with
+    // E_INVALIDARG on some Windows 11 + GPU driver combinations.
     src_attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-    // MinGW's mfreadwrite.h doesn't expose this attribute even though it's
-    // been in the Windows SDK since Win8. The GUID is stable.
-    static const GUID kMfReaderAdvancedVideoProcessing = {
-        0x0f81da2c, 0xb537, 0x4672,
-        { 0xa8, 0xb2, 0xa6, 0x81, 0xb1, 0x73, 0x07, 0xa3 } };
-    src_attrs->SetUINT32(kMfReaderAdvancedVideoProcessing, TRUE);
     src_attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
                          req.hardware ? TRUE : FALSE);
     src_attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA,
