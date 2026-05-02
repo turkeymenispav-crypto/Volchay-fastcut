@@ -1,0 +1,57 @@
+# Build artifacts
+build/
+build-*/
+out/
+cmake-build-*/
+dist/
+
+# IDE
+.vscode/
+.vs/
+.idea/
+*.swp
+*.swo
+*~
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+!cmake/mingw-w64-toolchain.cmake
+!cmake/*.cmake.in
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.ilk
+
+# Logs / dumps
+*.log
+*.dmp
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local user files
+.env
+.env.local
+
+# MSIX / installer outputs
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
+*.cer
+*.pfx

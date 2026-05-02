@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  mingw-cross:
+    name: Linux MinGW-w64 cross build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 + CMake + Ninja
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              mingw-w64 mingw-w64-tools cmake ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_TOOLCHAIN_FILE=cmake/mingw-w64-toolchain.cmake \
+                -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Inspect imports (sanity-check no extra DLLs are required)
+        run: |
+          x86_64-w64-mingw32-objdump -p build/volchay-fastcut.exe \
+              | grep "DLL Name" | sort -u
+
+      - name: Strip
+        run: |
+          x86_64-w64-mingw32-strip build/volchay-fastcut.exe
+          x86_64-w64-mingw32-strip build/volchay-register.exe
+          ls -lh build/volchay-fastcut.exe build/volchay-register.exe
+
+      - name: Stage artifact bundle
+        run: |
+          mkdir -p dist
+          cp build/volchay-fastcut.exe       dist/
+          cp build/volchay-register.exe      dist/
+          cp installer/register-context-menu.bat   dist/
+          cp installer/unregister-context-menu.bat dist/
+          cp README.md BUILD_WINDOWS.md LICENSE    dist/
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: volchay-fastcut-windows-x64-mingw
+          path: dist/
+
+  msvc-native:
+    name: Windows MSVC native build
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B build -A x64
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Stage artifact bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/volchay-fastcut.exe       dist/
+          Copy-Item build/Release/volchay-register.exe      dist/
+          Copy-Item installer/register-context-menu.bat     dist/
+          Copy-Item installer/unregister-context-menu.bat   dist/
+          Copy-Item README.md, BUILD_WINDOWS.md, LICENSE    dist/
+
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: volchay-fastcut-windows-x64-msvc
+          path: dist/

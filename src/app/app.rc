@@ -1,0 +1,40 @@
+#include <winver.h>
+
+// 101 = main window icon. Windows uses its default if the file is missing.
+// Drop a .ico into assets/ and uncomment the next line to bundle it.
+// 101 ICON "../../assets/app.ico"
+
+// Application manifest (DPI awareness, OS compatibility).
+1 24 "app.manifest"
+
+#define VOLCHAY_VER_FILE   0,1,0,0
+#define VOLCHAY_VER_PROD   0,1,0,0
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    VOLCHAY_VER_FILE
+PRODUCTVERSION VOLCHAY_VER_PROD
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         0x40004L
+FILETYPE       0x1L
+FILESUBTYPE    0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Volchay-fastcut contributors"
+            VALUE "FileDescription",  "Volchay-fastcut native video editor"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "volchay-fastcut"
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "OriginalFilename", "volchay-fastcut.exe"
+            VALUE "ProductName",      "Volchay-fastcut"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END
