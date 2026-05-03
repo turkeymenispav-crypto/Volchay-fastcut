@@ -1,5 +1,7 @@
 #include "ui/panels/export_panel.h"
 
+#include "core/clip.h"
+#include "core/project.h"
 #include "media/exporter.h"
 #include "ui/theme.h"
 
@@ -34,33 +36,32 @@ std::wstring pick_save_path(HWND owner, const wchar_t* default_name) {
     return std::wstring(buf);
 }
 
-// Indeterminate circular spinner. Uses ImDrawList to render an arc
-// that sweeps clockwise. Replaces ImGui::ProgressBar for the export
-// dialog (the user wanted a small spinning circle instead of a bar).
-void spinner(float radius, float thickness, ImU32 color, int segments = 24) {
+// Tiny "dot orbits a faint ring" spinner. A dim background ring is
+// drawn at full circumference, with a small bright dot running around
+// it. Compact, never looks like a near-full progress arc.
+void spinner(float radius, float dot_radius, ImU32 ring_color,
+             ImU32 dot_color) {
     ImGuiWindow* window = ImGui::GetCurrentWindow();
     if (window->SkipItems) return;
 
     ImVec2 pos = ImGui::GetCursorScreenPos();
-    float  size = (radius + thickness) * 2.0f;
+    float  size = (radius + dot_radius) * 2.0f;
     ImRect bb(pos, ImVec2(pos.x + size, pos.y + size));
     ImGui::ItemSize(bb);
     if (!ImGui::ItemAdd(bb, 0)) return;
 
-    ImVec2 center = ImVec2(pos.x + radius + thickness,
-                           pos.y + radius + thickness);
+    ImVec2 center = ImVec2(pos.x + radius + dot_radius,
+                           pos.y + radius + dot_radius);
     float t = float(ImGui::GetTime());
-    float start_angle = t * 3.0f;
-    float arc = float(IM_PI) * 1.4f;
+    float angle = t * 4.0f;
 
     ImDrawList* dl = window->DrawList;
-    dl->PathClear();
-    for (int i = 0; i <= segments; ++i) {
-        float a = start_angle + arc * (float(i) / float(segments));
-        dl->PathLineTo(ImVec2(center.x + std::cos(a) * radius,
-                              center.y + std::sin(a) * radius));
-    }
-    dl->PathStroke(color, ImDrawFlags_None, thickness);
+    // Faint background ring so the empty path is still visible.
+    dl->AddCircle(center, radius, ring_color, 32, 1.0f);
+    // Orbiting dot.
+    ImVec2 dot_pos = ImVec2(center.x + std::cos(angle) * radius,
+                            center.y + std::sin(angle) * radius);
+    dl->AddCircleFilled(dot_pos, dot_radius, dot_color, 12);
 }
 
 }  // namespace
@@ -190,12 +191,32 @@ void draw_export(EditorContext& ctx) {
                 }
             }
 
+            const bool can_export = ctx.player && ctx.player->is_open()
+                                  && dest_buf[0] != '\0';
+
+            // Honour the timeline trim. We export the source-media
+            // range corresponding to the (single) clip on the
+            // timeline; if there's no clip yet, fall back to the
+            // full source duration.
+            core::TimeUs export_src_in  = 0;
+            core::TimeUs export_src_out = -1;
+            if (ctx.project && !ctx.project->clips().empty()) {
+                const core::Clip& c = ctx.project->clips().front();
+                export_src_in  = c.src_in;
+                export_src_out = c.src_out;
+            } else if (ctx.player) {
+                export_src_out = ctx.player->duration();
+            }
+
+            ImGui::TextColored(theme().text_dim,
+                "Trim: %.2fs ... %.2fs (%.2fs)",
+                core::to_seconds(export_src_in),
+                core::to_seconds(export_src_out),
+                core::to_seconds(export_src_out - export_src_in));
+
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
-
-            const bool can_export = ctx.player && ctx.player->is_open()
-                                  && dest_buf[0] != '\0';
 
             ImGui::BeginDisabled(!can_export);
             if (ImGui::Button("Start export", ImVec2(160, 0))) {
@@ -222,22 +243,25 @@ void draw_export(EditorContext& ctx) {
                 r.video_bitrate = vbitrate_mbps * 1'000'000;
                 r.audio_bitrate = abitrate_values[abitrate_idx];
                 r.hardware      = hardware;
-                r.trim_start_us = 0;
-                r.trim_end_us   = ctx.player ? ctx.player->duration() : -1;
+                r.trim_start_us = export_src_in;
+                r.trim_end_us   = export_src_out;
                 ex.start(r);
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
             if (ImGui::Button("Close", ImVec2(100, 0))) *ctx.show_export = false;
         } else {
-            // Busy: small circular spinner instead of progress bar.
+            // Busy: small "dot orbiting a faint ring" spinner.
             ImGui::TextColored(theme().accent, "Encoding...");
             ImGui::Spacing();
             const float pct = ex.progress() * 100.0f;
-            ImU32 spin_color = ImGui::ColorConvertFloat4ToU32(theme().accent);
-            spinner(14.0f, 3.0f, spin_color);
+            ImVec4 dim = theme().accent;
+            dim.w *= 0.25f;
+            ImU32 ring_color = ImGui::ColorConvertFloat4ToU32(dim);
+            ImU32 dot_color  = ImGui::ColorConvertFloat4ToU32(theme().accent);
+            spinner(8.0f, 2.5f, ring_color, dot_color);
             ImGui::SameLine();
-            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 6);
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
             ImGui::Text("%.0f%%", pct);
             ImGui::Spacing();
             ImGui::TextColored(theme().text_dim, "%s", ex.status_text().c_str());
