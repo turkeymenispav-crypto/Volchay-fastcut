@@ -5,6 +5,7 @@
 #include "media/audio_player.h"
 #include "media/exporter.h"
 #include "ui/theme.h"
+#include "ui/widgets.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -162,25 +163,15 @@ void draw_export(EditorContext& ctx) {
             const ImVec2 cursor_start = ImGui::GetCursorPos();
             const float row_w = ImGui::GetContentRegionAvail().x;
 
-            // Big circular close button on the right. ~36×36 hit
-            // area, accent-tinted on hover so it's obviously
-            // interactive.
+            // Big pill close button on the right. ~36×36 hit area,
+            // turns red on hover so it's obviously the close action.
             const float btn_sz = row_h;
             ImGui::SetCursorPos(ImVec2(
                 cursor_start.x + row_w - btn_sz, cursor_start.y));
-            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, btn_sz * 0.5f);
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                ImVec4(theme().bg_button.x, theme().bg_button.y,
-                       theme().bg_button.z, 0.0f));   // transparent idle
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-                ImVec4(0.95f, 0.30f, 0.30f, 1.0f));   // red on hover
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-                ImVec4(0.80f, 0.20f, 0.20f, 1.0f));
-            if (ImGui::Button("X##export-close", ImVec2(btn_sz, btn_sz))) {
+            if (icon_button("\xC3\x97##export-close", btn_sz,
+                            ButtonStyle::Danger)) {
                 if (ctx.show_export) *ctx.show_export = false;
             }
-            ImGui::PopStyleColor(3);
-            ImGui::PopStyleVar();
 
             // Title text centred vertically with the close button.
             ImGui::SetCursorPos(cursor_start);
@@ -267,7 +258,8 @@ void draw_export(EditorContext& ctx) {
             ImGui::SetNextItemWidth(full_w - browse_w - 10.0f);
             ImGui::InputText("##dest", dest_buf, sizeof(dest_buf));
             ImGui::SameLine(0, 10);
-            if (ImGui::Button("Browse...", ImVec2(browse_w, 0))) {
+            if (pill_button("Browse...", ImVec2(browse_w, 32),
+                            ButtonStyle::Normal)) {
                 auto p = pick_save_path(nullptr, L"export.mp4");
                 if (!p.empty()) {
                     auto narrow = volchay::narrow(p);
@@ -343,18 +335,17 @@ void draw_export(EditorContext& ctx) {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX()
                 + (full_w - row_w) * 0.5f);
 
-            ImGui::BeginDisabled(!can_export);
-            if (ImGui::Button("Start export", btn_start)) {
+            if (pill_button("Start export", btn_start,
+                            ButtonStyle::Primary, can_export)) {
                 media::ExportRequest r;
                 build_request(r);
                 r.output_path = volchay::widen(dest_buf);
                 ex.start(r);
             }
-            ImGui::EndDisabled();
             ImGui::SameLine(0, gap);
             const bool can_replace = ctx.player && ctx.player->is_open();
-            ImGui::BeginDisabled(!can_replace);
-            if (ImGui::Button("Replace source video", btn_replace)) {
+            if (pill_button("Replace source video", btn_replace,
+                            ButtonStyle::Normal, can_replace)) {
                 int yn = ::MessageBoxW(nullptr,
                     L"This will export over the original source file.\n"
                     L"The original will be moved to a .bak next to it,\n"
@@ -381,9 +372,9 @@ void draw_export(EditorContext& ctx) {
                     ex.start(r);
                 }
             }
-            ImGui::EndDisabled();
             ImGui::SameLine(0, gap);
-            if (ImGui::Button("Close", btn_close)) *ctx.show_export = false;
+            if (pill_button("Close", btn_close, ButtonStyle::Ghost))
+                *ctx.show_export = false;
         } else {
             // Busy: small "dot orbiting a faint ring" spinner. Centred.
             const float full_w = ImGui::GetContentRegionAvail().x;
@@ -416,7 +407,7 @@ void draw_export(EditorContext& ctx) {
             const ImVec2 btn(140, 34);
             ImGui::SetCursorPosX(ImGui::GetCursorPosX()
                 + (full_w - btn.x) * 0.5f);
-            if (ImGui::Button("Cancel", btn)) ex.cancel();
+            if (pill_button("Cancel", btn, ButtonStyle::Danger)) ex.cancel();
         }
 
         if (ex.finished()) {

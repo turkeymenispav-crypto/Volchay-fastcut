@@ -1,6 +1,7 @@
 #include "ui/panels/settings.h"
 
 #include "ui/theme.h"
+#include "ui/widgets.h"
 #include "util/settings.h"
 
 #include <imgui.h>
@@ -93,7 +94,8 @@ bool draw_settings(EditorContext& ctx) {
         ImGui::Separator();
         ImGui::Spacing();
 
-        if (ImGui::Button("Reset to defaults", ImVec2(160, 0))) {
+        if (pill_button("Reset to defaults", ImVec2(160, 32),
+                        ButtonStyle::Ghost)) {
             s = Settings{};
             atlas_dirty = true;
         }

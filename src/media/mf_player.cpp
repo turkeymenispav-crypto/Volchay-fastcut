@@ -343,9 +343,24 @@ bool MfPlayer::worker_open(const std::wstring& path) {
     frame_  = av_frame_alloc();
     if (!packet_ || !frame_) return false;
 
+    // Preview-quality downscale. If a max display height is set and
+    // the source is taller than that, scale the BGRA buffer (and the
+    // GPU texture) down. We keep aspect by computing target width
+    // from the source aspect ratio, rounded to even pixels (BGRA is
+    // already byte-packed but other paths assume even strides).
+    int tex_w = w;
+    int tex_h = h;
+    const int max_h = preview_max_h_.load();
+    if (max_h > 0 && h > max_h) {
+        tex_h = max_h;
+        tex_w = int(double(w) * double(tex_h) / double(h));
+        tex_w = (tex_w / 2) * 2;
+        if (tex_w < 16) tex_w = 16;
+    }
+
     sws_ctx_ = sws_getContext(
         w, h, codec_ctx_->pix_fmt,
-        w, h, AV_PIX_FMT_BGRA,
+        tex_w, tex_h, AV_PIX_FMT_BGRA,
         SWS_BILINEAR, nullptr, nullptr, nullptr);
     if (!sws_ctx_) {
         log::err("sws_getContext failed for src fmt %d (%s)",
@@ -357,8 +372,8 @@ bool MfPlayer::worker_open(const std::wstring& path) {
 
     // Create the dynamic texture.
     D3D11_TEXTURE2D_DESC td{};
-    td.Width            = UINT(w);
-    td.Height           = UINT(h);
+    td.Width            = UINT(tex_w);
+    td.Height           = UINT(tex_h);
     td.MipLevels        = 1;
     td.ArraySize        = 1;
     td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -384,9 +399,9 @@ bool MfPlayer::worker_open(const std::wstring& path) {
 
     {
         std::lock_guard lk(buf_mu_);
-        shared_buf_.assign(size_t(w) * size_t(h) * 4, 0);
-        shared_buf_w_   = w;
-        shared_buf_h_   = h;
+        shared_buf_.assign(size_t(tex_w) * size_t(tex_h) * 4, 0);
+        shared_buf_w_   = tex_w;
+        shared_buf_h_   = tex_h;
         shared_buf_pts_ = -1;
     }
     frame_ready_.store(false);
@@ -398,7 +413,7 @@ bool MfPlayer::worker_open(const std::wstring& path) {
               av_get_pix_fmt_name(codec_ctx_->pix_fmt)
                 ? av_get_pix_fmt_name(codec_ctx_->pix_fmt) : "?",
               double(dur) / 1'000'000.0);
-    log::info("Video texture ready: %dx%d BGRA8 (dynamic)", w, h);
+    log::info("Video texture ready: %dx%d BGRA8 (dynamic, preview)", tex_w, tex_h);
     reader_open_.store(true);
     return true;
 }

@@ -139,6 +139,7 @@ set(VOLCHAY_SOURCES
     src/core/project.cpp
 
     src/ui/theme.cpp
+    src/ui/widgets.cpp
     src/ui/fonts.cpp
     src/ui/main_layout.cpp
     src/ui/panels/viewer.cpp

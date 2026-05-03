@@ -8,6 +8,7 @@
 #include "ui/panels/timeline.h"
 #include "ui/panels/viewer.h"
 #include "ui/theme.h"
+#include "ui/widgets.h"
 #include "util/log.h"
 
 #include <imgui.h>
@@ -130,22 +131,13 @@ void MainLayout::draw_menu_bar(EditorContext& ctx) {
         const bool can_export = ctx.player && ctx.player->is_open();
         const char* label = "Export";
         const ImVec2 size = ImVec2(
-            ImGui::CalcTextSize(label).x + 28.0f,
+            ImGui::CalcTextSize(label).x + 32.0f,
             ImGui::GetFrameHeight() - 4.0f);
         const float right_pad = 8.0f;
         ImGui::SameLine(ImGui::GetWindowWidth() - size.x - right_pad);
-
-        // Filled accent button so it reads as the primary action.
-        ImGui::PushStyleColor(ImGuiCol_Button,        theme().accent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme().accent_hover);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  theme().accent_active);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
-        ImGui::BeginDisabled(!can_export);
-        if (ImGui::Button(label, size)) {
+        if (pill_button(label, size, ButtonStyle::Primary, can_export)) {
             if (ctx.show_export) *ctx.show_export = true;
         }
-        ImGui::EndDisabled();
-        ImGui::PopStyleColor(4);
     }
 
     ImGui::EndMainMenuBar();
@@ -208,6 +200,26 @@ void MainLayout::draw_status_strip(EditorContext& ctx) {
 }
 
 void MainLayout::render(EditorContext& ctx) {
+    // Wire viewer state out so panels and App can read/write it.
+    ctx.fullscreen          = &fullscreen_;
+    ctx.preview_quality_idx = &preview_quality_idx_;
+    ctx.aspect_idx          = &aspect_idx_;
+
+    // F11 / Esc shortcut for fullscreen toggle. ImGui::IsKeyPressed
+    // honours focus, so it won't fire while the user is typing.
+    if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) fullscreen_ = !fullscreen_;
+    if (fullscreen_ && ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        fullscreen_ = false;
+
+    // Fullscreen path: hide menu, panels, and status strip; the viewer
+    // is pinned to the entire viewport. The export window can still be
+    // opened (e.g. via Ctrl+E) and floats on top.
+    if (fullscreen_) {
+        panels::draw_viewer(ctx);
+        panels::draw_export(ctx);
+        return;
+    }
+
     // Host window covers the entire viewport with a dock space, leaving
     // room above for the menu bar and below for the status strip. The
     // status strip height MUST match draw_status_strip() exactly so the
@@ -263,7 +275,8 @@ void MainLayout::render(EditorContext& ctx) {
             "Native Windows 11 video editor focused on instant cold start "
             "and frame-accurate editing. ImGui + Direct3D 11 + Media Foundation.");
         ImGui::Spacing();
-        if (ImGui::Button("OK", ImVec2(120, 0))) ImGui::CloseCurrentPopup();
+        if (pill_button("OK", ImVec2(120, 32), ButtonStyle::Primary))
+            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 

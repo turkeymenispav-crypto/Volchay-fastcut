@@ -3,6 +3,7 @@
 #include "media/audio_player.h"
 #include "ui/main_layout.h"
 #include "ui/theme.h"
+#include "ui/widgets.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -69,16 +70,18 @@ void draw_timeline(EditorContext& ctx) {
     // Transport bar.
     {
         bool playing = project->is_playing();
-        if (ImGui::Button(playing ? "Pause" : "Play")) {
+        if (pill_button(playing ? "Pause" : "Play", ImVec2(78, 30),
+                        playing ? ButtonStyle::Primary
+                                : ButtonStyle::Normal)) {
             project->set_playing(!playing);
         }
         ImGui::SameLine();
-        if (ImGui::Button("|<")) {
+        if (pill_button("|<", ImVec2(40, 30), ButtonStyle::Normal)) {
             project->set_playhead(0);
             sync_player_seek(0);
         }
         ImGui::SameLine();
-        if (ImGui::Button(">|")) {
+        if (pill_button(">|", ImVec2(40, 30), ButtonStyle::Normal)) {
             const auto d = project->duration();
             project->set_playhead(d);
             sync_player_seek(d);
@@ -86,7 +89,8 @@ void draw_timeline(EditorContext& ctx) {
         ImGui::SameLine(0, 16);
 
         // Editing buttons.
-        if (ImGui::Button("Cut at \xe2\x96\xbc")) {  // "Cut at ▼"
+        if (pill_button("Cut at \xe2\x96\xbc", ImVec2(0, 30),  // "Cut at ▼"
+                        ButtonStyle::Normal)) {
             project->split_at(project->playhead());
         }
         if (ImGui::IsItemHovered()) {
@@ -94,14 +98,14 @@ void draw_timeline(EditorContext& ctx) {
         }
         ImGui::SameLine();
         const bool has_sel = project->any_selected();
-        ImGui::BeginDisabled(!has_sel);
-        if (ImGui::Button("Delete")) {
+        if (pill_button("Delete", ImVec2(74, 30),
+                        has_sel ? ButtonStyle::Danger : ButtonStyle::Normal,
+                        has_sel)) {
             project->delete_selected(ripple_delete);
         }
         if (ImGui::IsItemHovered() && has_sel) {
             ImGui::SetTooltip("Delete selected clip(s) (Del / Backspace)");
         }
-        ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::Checkbox("Ripple", &ripple_delete);
         if (ImGui::IsItemHovered()) {
@@ -110,13 +114,13 @@ void draw_timeline(EditorContext& ctx) {
         }
         ImGui::SameLine(0, 12);
 
-        ImGui::BeginDisabled(!project->can_undo());
-        if (ImGui::Button("Undo")) project->undo();
-        ImGui::EndDisabled();
+        if (pill_button("Undo", ImVec2(64, 30), ButtonStyle::Ghost,
+                        project->can_undo()))
+            project->undo();
         ImGui::SameLine();
-        ImGui::BeginDisabled(!project->can_redo());
-        if (ImGui::Button("Redo")) project->redo();
-        ImGui::EndDisabled();
+        if (pill_button("Redo", ImVec2(64, 30), ButtonStyle::Ghost,
+                        project->can_redo()))
+            project->redo();
 
         ImGui::SameLine(0, 16);
 

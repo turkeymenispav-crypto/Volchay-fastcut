@@ -94,6 +94,18 @@ public:
     // automatically. Kept so call sites don't have to change.
     void set_prefer_hardware(bool /*on*/) {}
 
+    // Preview quality. Sets the maximum height of the BGRA texture
+    // used for on-screen display. The decoder still runs at the
+    // source resolution; only the swscale stage and the GPU texture
+    // are smaller, which cuts upload bandwidth and helps the UI
+    // stay responsive on 4K HDR sources. Pass 0 to disable scaling
+    // (the texture matches source dimensions). Effective on the
+    // next open(); does NOT affect export.
+    void set_preview_max_height(int max_h) {
+        preview_max_h_.store(max_h < 0 ? 0 : max_h);
+    }
+    int preview_max_height() const { return preview_max_h_.load(); }
+
 private:
     // ---- Worker thread (owns the libav decoder) ----
     void worker_main();
@@ -145,6 +157,10 @@ private:
     std::atomic<core::TimeUs>   duration_{0};
     std::atomic<core::TimeUs>   current_pts_{-1};
     std::atomic<bool>           hardware_decode_{false};
+    // 0 = source-resolution preview; >0 = scale down so the texture
+    // height equals min(source_h, preview_max_h_). Read by the
+    // worker on open().
+    std::atomic<int>            preview_max_h_{0};
     std::wstring                source_path_;
 
     // Frame hand-off. Worker fills shared_buf_ with BGRA32 rows

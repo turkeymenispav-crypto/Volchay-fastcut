@@ -3,6 +3,7 @@
 #include "platform/windows.h"
 #include "ui/main_layout.h"
 #include "ui/theme.h"
+#include "ui/widgets.h"
 
 #include <imgui.h>
 
@@ -11,7 +12,8 @@ namespace volchay::ui::panels {
 void draw_library(EditorContext& ctx) {
     ImGui::Begin("Library");
 
-    if (ImGui::Button("+ Import video")) {
+    if (pill_button("+ Import video", ImVec2(140, 32),
+                    ButtonStyle::Primary)) {
         if (ctx.open_file) ctx.open_file(L"");
     }
     ImGui::SameLine();

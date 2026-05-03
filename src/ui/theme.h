@@ -1,7 +1,7 @@
-// Visual theme. "Luna" — a modern editor look, deep slate-blue
-// surface with a soft violet accent. Colours are kept in one place
-// so every panel pulls from the same tokens instead of hard-coding
-// ImVec4s.
+// Visual theme. "Luna Sky" — a modern editor look, deep slate-blue
+// surface with a soft sky-blue accent. Colours are kept in one
+// place so every panel pulls from the same tokens instead of
+// hard-coding ImVec4s.
 #pragma once
 
 #include <imgui.h>
@@ -19,25 +19,26 @@ struct Theme {
     ImVec4 bg_button_hover   {0.198f, 0.235f, 0.299f, 1.0f};
     ImVec4 bg_button_active  {0.250f, 0.293f, 0.366f, 1.0f};
     ImVec4 separator         {0.020f, 0.026f, 0.040f, 1.0f};   // hairline divider
-    ImVec4 separator_hover   {0.486f, 0.557f, 0.973f, 1.0f};   // accent
+    ImVec4 separator_hover   {0.302f, 0.816f, 0.882f, 1.0f};   // accent
 
     // Text.
     ImVec4 text              {0.910f, 0.918f, 0.945f, 1.0f};   // #E8EAF1
     ImVec4 text_dim          {0.560f, 0.578f, 0.640f, 1.0f};   // #8E94A4
     ImVec4 text_disabled     {0.380f, 0.396f, 0.448f, 1.0f};
 
-    // Accent — "Luna" soft violet-blue (#7C8EF8).
-    ImVec4 accent            {0.486f, 0.557f, 0.973f, 1.0f};
-    ImVec4 accent_hover      {0.583f, 0.651f, 0.984f, 1.0f};
-    ImVec4 accent_active     {0.388f, 0.451f, 0.847f, 1.0f};
+    // Accent — Luna Sky aqua-cyan (#4DD0E1). Distinct from the
+    // Microsoft system blue, sits between cyan and teal.
+    ImVec4 accent            {0.302f, 0.816f, 0.882f, 1.0f};   // #4DD0E1
+    ImVec4 accent_hover      {0.420f, 0.870f, 0.918f, 1.0f};   // #6BDDEA
+    ImVec4 accent_active     {0.180f, 0.690f, 0.770f, 1.0f};   // #2EB0C4
 
     // Timeline-specific.
     ImVec4 timeline_bg       {0.046f, 0.054f, 0.078f, 1.0f};
     ImVec4 timeline_grid     {0.166f, 0.193f, 0.252f, 1.0f};
     ImVec4 timeline_grid_sub {0.103f, 0.121f, 0.162f, 1.0f};
-    ImVec4 timeline_clip     {0.181f, 0.215f, 0.401f, 1.0f};   // muted violet-blue
-    ImVec4 timeline_clip_sel {0.486f, 0.557f, 0.973f, 1.0f};   // accent
-    ImVec4 timeline_playhead {0.710f, 0.770f, 1.000f, 1.0f};   // bright violet
+    ImVec4 timeline_clip     {0.130f, 0.300f, 0.340f, 1.0f};   // muted teal
+    ImVec4 timeline_clip_sel {0.302f, 0.816f, 0.882f, 1.0f};   // accent
+    ImVec4 timeline_playhead {0.560f, 0.920f, 0.960f, 1.0f};   // bright aqua
 
     float corner_radius   = 6.0f;
     float frame_padding_y = 7.0f;
