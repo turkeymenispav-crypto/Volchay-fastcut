@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 
 namespace volchay::ui::panels {
@@ -35,6 +36,19 @@ std::wstring pick_save_path(HWND owner, const wchar_t* default_name) {
 
     if (!::GetSaveFileNameW(&ofn)) return {};
     return std::wstring(buf);
+}
+
+// Center-align a single line within the current content region.
+void center_text(ImVec4 col, const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    float w = ImGui::CalcTextSize(buf).x;
+    float avail = ImGui::GetContentRegionAvail().x;
+    if (w < avail) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - w) * 0.5f);
+    ImGui::TextColored(col, "%s", buf);
 }
 
 // Tiny "dot orbits a faint ring" spinner. A dim background ring is
@@ -123,66 +137,96 @@ void draw_export(EditorContext& ctx) {
         vbitrate_mbps = std::max(1, p.video_bitrate / 1'000'000);
     };
 
-    ImGui::SetNextWindowSize(ImVec2(620, 520), ImGuiCond_FirstUseEver);
+    // Bigger panel + chubby paddings inside. The form lives on a
+    // single column where every label is centred and every input
+    // spans the full content width — closer to a wizard / settings
+    // sheet than a debug tool window.
+    ImGui::SetNextWindowSize(ImVec2(560, 720), ImGuiCond_FirstUseEver);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28, 24));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(12, 9));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(10, 10));
     if (ImGui::Begin("Export", ctx.show_export, ImGuiWindowFlags_NoCollapse)) {
         media::Exporter& ex = *ctx.exporter;
         const bool busy = ex.busy();
 
+        // Title.
+        center_text(theme().text, "Export video");
+        ImGui::Spacing();
+
         if (!busy) {
-            ImGui::TextColored(theme().text_dim, "Quick preset:");
+            const float full_w = ImGui::GetContentRegionAvail().x;
+
+            auto label = [&](const char* s) {
+                ImGui::Spacing();
+                center_text(theme().text_dim, "%s", s);
+            };
+
+            label("Quick preset");
             const char* labels[16];
             int count = std::min(media::kPresetCount, 16);
             for (int i = 0; i < count; ++i) labels[i] = media::kPresets[i].label;
+            ImGui::SetNextItemWidth(full_w);
             if (ImGui::Combo("##preset", &preset_index, labels, count)) {
                 apply_preset(preset_index);
             }
-            ImGui::Spacing();
 
-            ImGui::TextColored(theme().text_dim, "Codec");
+            label("Codec");
+            ImGui::SetNextItemWidth(full_w);
             ImGui::Combo("##codec", &codec_idx, codec_labels,
                          IM_ARRAYSIZE(codec_labels));
 
-            ImGui::TextColored(theme().text_dim, "Resolution");
+            label("Resolution");
+            ImGui::SetNextItemWidth(full_w);
             ImGui::Combo("##resolution", &resolution_idx, resolution_labels,
                          IM_ARRAYSIZE(resolution_labels));
-            if (resolution_idx == 5) {  // Custom
-                ImGui::PushItemWidth(80);
-                ImGui::InputInt("W", &custom_w, 0);
-                ImGui::SameLine();
-                ImGui::InputInt("H", &custom_h, 0);
-                ImGui::PopItemWidth();
+            if (resolution_idx == 5) {  // Custom — two centred fields.
+                const float field_w = (full_w - 10.0f) * 0.5f;
+                ImGui::SetNextItemWidth(field_w);
+                ImGui::InputInt("##cw", &custom_w, 0);
+                ImGui::SameLine(0, 10);
+                ImGui::SetNextItemWidth(field_w);
+                ImGui::InputInt("##ch", &custom_h, 0);
                 custom_w = std::clamp(custom_w, 16, 8192);
                 custom_h = std::clamp(custom_h, 16, 8192);
             }
 
-            ImGui::TextColored(theme().text_dim, "Frame rate");
+            label("Frame rate");
+            ImGui::SetNextItemWidth(full_w);
             ImGui::Combo("##fps", &fps_idx, fps_labels,
                          IM_ARRAYSIZE(fps_labels));
             if (fps_idx == 4) {
-                ImGui::PushItemWidth(120);
-                ImGui::InputInt("fps", &custom_fps, 0);
-                ImGui::PopItemWidth();
+                ImGui::SetNextItemWidth(full_w);
+                ImGui::InputInt("##cfps", &custom_fps, 0);
                 custom_fps = std::clamp(custom_fps, 1, 480);
             }
 
-            ImGui::TextColored(theme().text_dim, "Video bitrate (Mbps)");
-            ImGui::PushItemWidth(180);
+            label("Video bitrate (Mbps)");
+            ImGui::SetNextItemWidth(full_w);
             ImGui::InputInt("##vbitrate", &vbitrate_mbps, 1, 5);
-            ImGui::PopItemWidth();
             vbitrate_mbps = std::clamp(vbitrate_mbps, 1, 500);
 
-            ImGui::TextColored(theme().text_dim, "Audio bitrate");
+            label("Audio bitrate");
+            ImGui::SetNextItemWidth(full_w);
             ImGui::Combo("##abitrate", &abitrate_idx, abitrate_labels,
                          IM_ARRAYSIZE(abitrate_labels));
 
-            ImGui::Checkbox("Hardware encode (NVENC / Quick Sync / AMF)",
-                            &hardware);
-
             ImGui::Spacing();
-            ImGui::TextColored(theme().text_dim, "Destination:");
+            // Centre the checkbox.
+            {
+                const char* txt = "Hardware encode (NVENC / Quick Sync / AMF)";
+                float w = ImGui::CalcTextSize(txt).x
+                        + ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (full_w - w) * 0.5f);
+                ImGui::Checkbox(txt, &hardware);
+            }
+
+            label("Destination");
+            // dest field + Browse on the right, full width.
+            const float browse_w = 100.0f;
+            ImGui::SetNextItemWidth(full_w - browse_w - 10.0f);
             ImGui::InputText("##dest", dest_buf, sizeof(dest_buf));
-            ImGui::SameLine();
-            if (ImGui::Button("Browse...")) {
+            ImGui::SameLine(0, 10);
+            if (ImGui::Button("Browse...", ImVec2(browse_w, 0))) {
                 auto p = pick_save_path(nullptr, L"export.mp4");
                 if (!p.empty()) {
                     auto narrow = volchay::narrow(p);
@@ -209,7 +253,8 @@ void draw_export(EditorContext& ctx) {
                 export_src_out = ctx.player->duration();
             }
 
-            ImGui::TextColored(theme().text_dim,
+            ImGui::Spacing();
+            center_text(theme().text_dim,
                 "Trim: %.2fs ... %.2fs (%.2fs)",
                 core::to_seconds(export_src_in),
                 core::to_seconds(export_src_out),
@@ -247,18 +292,28 @@ void draw_export(EditorContext& ctx) {
                 r.trim_end_us   = export_src_out;
             };
 
+            // Centered button row.
+            const ImVec2 btn_start (160, 36);
+            const ImVec2 btn_replace(200, 36);
+            const ImVec2 btn_close (110, 36);
+            const float gap = 10.0f;
+            const float row_w = btn_start.x + btn_replace.x + btn_close.x
+                              + gap * 2.0f;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX()
+                + (full_w - row_w) * 0.5f);
+
             ImGui::BeginDisabled(!can_export);
-            if (ImGui::Button("Start export", ImVec2(160, 0))) {
+            if (ImGui::Button("Start export", btn_start)) {
                 media::ExportRequest r;
                 build_request(r);
                 r.output_path = volchay::widen(dest_buf);
                 ex.start(r);
             }
             ImGui::EndDisabled();
-            ImGui::SameLine();
+            ImGui::SameLine(0, gap);
             const bool can_replace = ctx.player && ctx.player->is_open();
             ImGui::BeginDisabled(!can_replace);
-            if (ImGui::Button("Replace source video", ImVec2(180, 0))) {
+            if (ImGui::Button("Replace source video", btn_replace)) {
                 int yn = ::MessageBoxW(nullptr,
                     L"This will export over the original source file.\n"
                     L"The original will be moved to a .bak next to it,\n"
@@ -286,25 +341,41 @@ void draw_export(EditorContext& ctx) {
                 }
             }
             ImGui::EndDisabled();
-            ImGui::SameLine();
-            if (ImGui::Button("Close", ImVec2(100, 0))) *ctx.show_export = false;
+            ImGui::SameLine(0, gap);
+            if (ImGui::Button("Close", btn_close)) *ctx.show_export = false;
         } else {
-            // Busy: small "dot orbiting a faint ring" spinner.
-            ImGui::TextColored(theme().accent, "Encoding...");
+            // Busy: small "dot orbiting a faint ring" spinner. Centred.
+            const float full_w = ImGui::GetContentRegionAvail().x;
             ImGui::Spacing();
+            center_text(theme().accent, "Encoding...");
+            ImGui::Spacing();
+
             const float pct = ex.progress() * 100.0f;
             ImVec4 dim = theme().accent;
             dim.w *= 0.25f;
             ImU32 ring_color = ImGui::ColorConvertFloat4ToU32(dim);
             ImU32 dot_color  = ImGui::ColorConvertFloat4ToU32(theme().accent);
+
+            // Centre the spinner + percentage as a unit.
+            char pct_buf[16];
+            ::snprintf(pct_buf, sizeof(pct_buf), "%.0f%%", pct);
+            const float spinner_w = (8.0f + 2.5f) * 2.0f;
+            const float pct_w     = ImGui::CalcTextSize(pct_buf).x;
+            const float row_w     = spinner_w + 8.0f + pct_w;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX()
+                + (full_w - row_w) * 0.5f);
             spinner(8.0f, 2.5f, ring_color, dot_color);
-            ImGui::SameLine();
+            ImGui::SameLine(0, 8.0f);
             ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 4);
-            ImGui::Text("%.0f%%", pct);
+            ImGui::Text("%s", pct_buf);
             ImGui::Spacing();
-            ImGui::TextColored(theme().text_dim, "%s", ex.status_text().c_str());
+            center_text(theme().text_dim, "%s", ex.status_text().c_str());
             ImGui::Spacing();
-            if (ImGui::Button("Cancel", ImVec2(120, 0))) ex.cancel();
+
+            const ImVec2 btn(140, 34);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX()
+                + (full_w - btn.x) * 0.5f);
+            if (ImGui::Button("Cancel", btn)) ex.cancel();
         }
 
         if (ex.finished()) {
@@ -416,6 +487,7 @@ void draw_export(EditorContext& ctx) {
         }
     }
     ImGui::End();
+    ImGui::PopStyleVar(3);
 }
 
 }  // namespace volchay::ui::panels

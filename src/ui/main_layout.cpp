@@ -122,6 +122,32 @@ void MainLayout::draw_menu_bar(EditorContext& ctx) {
         if (ImGui::MenuItem("About Volchay-fastcut")) show_about_ = true;
         ImGui::EndMenu();
     }
+
+    // Top-right Export shortcut. Pinned to the right edge of the
+    // main menu bar so it's reachable from any panel without
+    // navigating into the File menu.
+    {
+        const bool can_export = ctx.player && ctx.player->is_open();
+        const char* label = "Export";
+        const ImVec2 size = ImVec2(
+            ImGui::CalcTextSize(label).x + 28.0f,
+            ImGui::GetFrameHeight() - 4.0f);
+        const float right_pad = 8.0f;
+        ImGui::SameLine(ImGui::GetWindowWidth() - size.x - right_pad);
+
+        // Filled accent button so it reads as the primary action.
+        ImGui::PushStyleColor(ImGuiCol_Button,        theme().accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, theme().accent_hover);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  theme().accent_active);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1, 1, 1, 1));
+        ImGui::BeginDisabled(!can_export);
+        if (ImGui::Button(label, size)) {
+            if (ctx.show_export) *ctx.show_export = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::PopStyleColor(4);
+    }
+
     ImGui::EndMainMenuBar();
 }
 
