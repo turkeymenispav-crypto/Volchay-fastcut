@@ -25,7 +25,23 @@ std::wstring resolve_exe_path(const wchar_t* override_path) {
     wchar_t buf[MAX_PATH] = L"";
     DWORD n = ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
     if (n == 0 || n == MAX_PATH) return {};
-    return std::wstring(buf, n);
+    std::wstring self(buf, n);
+
+    // Prefer "volchay-fastcut.exe" in the same directory if we can find
+    // it. The registrar utility itself is a console app and must NOT be
+    // pointed to from the context menu; otherwise clicking the entry
+    // just flashes a console window and exits.
+    size_t slash = self.find_last_of(L"\\/");
+    std::wstring dir = (slash == std::wstring::npos)
+                       ? std::wstring{}
+                       : self.substr(0, slash + 1);
+    std::wstring candidate = dir + L"volchay-fastcut.exe";
+    DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES
+        && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return candidate;
+    }
+    return self;
 }
 
 LONG set_str(HKEY base, const std::wstring& sub,
