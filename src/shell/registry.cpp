@@ -127,6 +127,11 @@ LONG unregister_extension(HKEY base, const wchar_t* ext) {
     delete_tree(base,
         std::wstring(L"Software\\Classes\\SystemFileAssociations\\")
         + ext + L"\\shell\\" + kVerbName);
+    // Also remove any older registration that lived directly under the
+    // extension's own \shell tree (some earlier builds wrote there).
+    delete_tree(base,
+        std::wstring(L"Software\\Classes\\")
+        + ext + L"\\shell\\" + kVerbName);
     return ERROR_SUCCESS;
 }
 
@@ -152,11 +157,18 @@ LONG register_context_menu(bool per_user, const wchar_t* exe_path) {
 }
 
 LONG unregister_context_menu(bool per_user) {
-    HKEY base = per_user ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
-    for (int i = 0; i < kRegisteredExtensionCount; ++i) {
-        unregister_extension(base, kRegisteredExtensions[i]);
+    // Unregister from BOTH scopes. The flag is preserved for API compat,
+    // but a partial cleanup leaves dangling entries in the other scope
+    // (e.g. when the user registered with --machine but unregisters
+    // without it). Since we only ever touch keys we own, this is safe.
+    (void)per_user;
+    HKEY scopes[] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+    for (HKEY base : scopes) {
+        for (int i = 0; i < kRegisteredExtensionCount; ++i) {
+            unregister_extension(base, kRegisteredExtensions[i]);
+        }
+        delete_tree(base, std::wstring(L"Software\\Classes\\") + kProgId);
     }
-    delete_tree(base, std::wstring(L"Software\\Classes\\") + kProgId);
     ::SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return ERROR_SUCCESS;
 }
