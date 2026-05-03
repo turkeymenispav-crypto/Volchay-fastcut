@@ -90,6 +90,7 @@ void draw_export(EditorContext& ctx) {
     static int  codec_idx      = 0;     // 0 = H.264, 1 = HEVC
     static int  resolution_idx = 0;     // 0 = source
     static int  fps_idx        = 0;     // 0 = source
+    static int  aspect_idx     = 0;     // 0 = source (no AR override)
     static int  custom_w       = 1920;
     static int  custom_h       = 1080;
     static int  custom_fps     = 60;
@@ -98,6 +99,7 @@ void draw_export(EditorContext& ctx) {
     static bool hardware       = true;
     static char dest_buf[512]  = "";
     static bool dest_set       = false;
+    static bool was_open       = false;
 
     const char* codec_labels[]      = { "H.264", "HEVC (H.265)" };
     const char* resolution_labels[] = { "Source", "1280x720", "1920x1080",
@@ -108,6 +110,19 @@ void draw_export(EditorContext& ctx) {
     const int   fps_values[]        = {       0,  24,   30,   60,        0 };
     const char* abitrate_labels[]   = { "128 kbps", "192 kbps", "320 kbps" };
     const int   abitrate_values[]   = { 128'000,    192'000,    320'000   };
+    const char* aspect_labels[]     = { "Source (no crop)", "1:1", "4:3",
+                                        "16:9", "9:16", "21:9" };
+    const double aspect_values[]    = { 0.0, 1.0, 4.0/3.0,
+                                        16.0/9.0, 9.0/16.0, 21.0/9.0 };
+    constexpr int aspect_count = 6;
+
+    // First time the panel comes up in this session, mirror the
+    // viewer's AR/quality so the user doesn't have to set it twice.
+    if (!was_open) {
+        if (ctx.aspect_idx) aspect_idx = std::clamp(*ctx.aspect_idx,
+                                                    0, aspect_count - 1);
+        was_open = true;
+    }
 
     auto apply_preset = [&](int idx) {
         if (idx < 0 || idx >= media::kPresetCount) return;
@@ -222,6 +237,16 @@ void draw_export(EditorContext& ctx) {
                 custom_h = std::clamp(custom_h, 16, 8192);
             }
 
+            label("Aspect ratio");
+            ImGui::SetNextItemWidth(full_w);
+            ImGui::Combo("##aspect", &aspect_idx, aspect_labels, aspect_count);
+            if (aspect_idx > 0) {
+                ImGui::Spacing();
+                center_text(theme().text_dim,
+                    "Source frame is centre-cropped to %s before encode.",
+                    aspect_labels[aspect_idx]);
+            }
+
             label("Frame rate");
             ImGui::SetNextItemWidth(full_w);
             ImGui::Combo("##fps", &fps_idx, fps_labels,
@@ -321,6 +346,7 @@ void draw_export(EditorContext& ctx) {
                 r.video_bitrate = vbitrate_mbps * 1'000'000;
                 r.audio_bitrate = abitrate_values[abitrate_idx];
                 r.hardware      = hardware;
+                r.aspect_ratio  = aspect_values[aspect_idx];
                 r.trim_start_us = export_src_in;
                 r.trim_end_us   = export_src_out;
             };

@@ -269,8 +269,45 @@ void Exporter::run_one_export(ExportRequest req) {
     }
 
     AVCodecContext* v_enc_ctx = avcodec_alloc_context3(v_enc);
-    int out_w = (req.width  > 0) ? req.width  : v_dec_ctx->width;
-    int out_h = (req.height > 0) ? req.height : v_dec_ctx->height;
+
+    // Aspect-ratio crop (matches the viewer's "AR:" combo). When the
+    // user picks a non-source AR, we centre-crop the source frame to
+    // that ratio before scaling to the encoder. We compute the crop
+    // rectangle here so it can also constrain the output resolution.
+    const int src_w = v_dec_ctx->width;
+    const int src_h = v_dec_ctx->height;
+    int crop_w = src_w, crop_h = src_h, crop_x = 0, crop_y = 0;
+    if (req.aspect_ratio > 0.0) {
+        const double src_ar = double(src_w) / double(std::max(1, src_h));
+        if (req.aspect_ratio > src_ar) {
+            // Output is wider than source: crop top + bottom.
+            crop_h = int(double(src_w) / req.aspect_ratio + 0.5);
+            crop_h &= ~1;
+            crop_y = ((src_h - crop_h) / 2) & ~1;
+        } else if (req.aspect_ratio < src_ar) {
+            // Output is taller: crop left + right.
+            crop_w = int(double(src_h) * req.aspect_ratio + 0.5);
+            crop_w &= ~1;
+            crop_x = ((src_w - crop_w) / 2) & ~1;
+        }
+    }
+
+    int out_w = (req.width  > 0) ? req.width  : crop_w;
+    int out_h = (req.height > 0) ? req.height : crop_h;
+    if (req.aspect_ratio > 0.0 && req.width == 0 && req.height == 0) {
+        // No explicit resolution + AR override: use the cropped size.
+        out_w = crop_w;
+        out_h = crop_h;
+    } else if (req.aspect_ratio > 0.0 && (req.width > 0 || req.height > 0)) {
+        // User pinned a resolution AND wants an AR override. Snap
+        // out_h to match req.aspect_ratio so the encoded image
+        // doesn't get stretched.
+        if (req.width > 0 && req.height == 0) {
+            out_h = int(double(req.width) / req.aspect_ratio + 0.5);
+        } else if (req.height > 0 && req.width == 0) {
+            out_w = int(double(req.height) * req.aspect_ratio + 0.5);
+        }
+    }
     out_w &= ~1;          // even dimensions for h264/hevc
     out_h &= ~1;
     v_enc_ctx->width  = out_w;
@@ -319,8 +356,11 @@ void Exporter::run_one_export(ExportRequest req) {
         avformat_close_input(&in_fmt);
         return;
     }
-    log::info("Exporter: encoder = %s, %dx%d, %d kbps, %d/%d fps, pix=%s",
-              v_enc->name, out_w, out_h, req.video_bitrate / 1000,
+    log::info("Exporter: encoder = %s, %dx%d (src %dx%d crop %dx%d+%d+%d), "
+              "%d kbps, %d/%d fps, pix=%s",
+              v_enc->name, out_w, out_h,
+              src_w, src_h, crop_w, crop_h, crop_x, crop_y,
+              req.video_bitrate / 1000,
               v_enc_ctx->framerate.num, v_enc_ctx->framerate.den,
               av_get_pix_fmt_name(v_enc_ctx->pix_fmt));
 
@@ -450,10 +490,49 @@ void Exporter::run_one_export(ExportRequest req) {
     // ------------------------------------------------------------------
     set_status("Encoding...");
 
+    // sws_scale runs on the cropped sub-region of every decoded
+    // frame. Per-frame we offset dec_frame->data[] pointers using
+    // the crop_x/crop_y origin computed above; the linesize stays the
+    // same as the source.
     SwsContext* sws = sws_getContext(
-        v_dec_ctx->width, v_dec_ctx->height, v_dec_ctx->pix_fmt,
+        crop_w, crop_h, v_dec_ctx->pix_fmt,
         out_w, out_h, v_enc_ctx->pix_fmt,
         SWS_BILINEAR, nullptr, nullptr, nullptr);
+
+    // Helper: compute offset src_data pointers into a decoded frame
+    // for the centre-crop window. Linesize is unchanged. Works for
+    // any planar / semi-planar format (YUV420P, NV12, YUV422P, ...).
+    auto crop_offsets = [&](const AVFrame* f,
+                            uint8_t* out_data[4], int out_ls[4]) {
+        const AVPixelFormat fmt = (AVPixelFormat)f->format;
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fmt);
+        int bps[4]  = {1, 1, 1, 1};
+        int hsub[4] = {0, 0, 0, 0};
+        int vsub[4] = {0, 0, 0, 0};
+        bool has[4] = {false, false, false, false};
+        if (d) {
+            for (int c = 0; c < d->nb_components; ++c) {
+                int p = d->comp[c].plane;
+                if (p < 0 || p >= 4) continue;
+                bps[p] = std::max(bps[p], int(d->comp[c].step));
+                if (c == 1 || c == 2) {
+                    hsub[p] = d->log2_chroma_w;
+                    vsub[p] = d->log2_chroma_h;
+                }
+                has[p] = true;
+            }
+        }
+        for (int p = 0; p < 4; ++p) {
+            out_ls[p] = f->linesize[p];
+            if (!f->data[p] || !has[p]) {
+                out_data[p] = f->data[p];
+                continue;
+            }
+            out_data[p] = f->data[p]
+                + (crop_y >> vsub[p]) * f->linesize[p]
+                + (crop_x >> hsub[p]) * bps[p];
+        }
+    };
 
     AVPacket* pkt        = av_packet_alloc();
     AVPacket* enc_pkt    = av_packet_alloc();
@@ -540,11 +619,15 @@ void Exporter::run_one_export(ExportRequest req) {
                 progress_.store(float(double(pts_us - req.trim_start_us) /
                                       double(span_us)));
 
-                // Convert + scale to encoder pix_fmt.
+                // Crop + convert + scale to encoder pix_fmt. When the
+                // user picked a non-source AR, src_data points into
+                // the centre-crop region of dec_frame; otherwise it's
+                // the full frame.
                 if (sws) {
-                    sws_scale(sws,
-                              dec_frame->data, dec_frame->linesize,
-                              0, dec_frame->height,
+                    uint8_t* src_data[4];
+                    int      src_ls[4];
+                    crop_offsets(dec_frame, src_data, src_ls);
+                    sws_scale(sws, src_data, src_ls, 0, crop_h,
                               enc_frame->data, enc_frame->linesize);
                 }
                 enc_frame->pts = v_pts_count++;
@@ -615,8 +698,10 @@ void Exporter::run_one_export(ExportRequest req) {
             if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
             if (rc < 0) break;
             if (sws) {
-                sws_scale(sws, dec_frame->data, dec_frame->linesize,
-                          0, dec_frame->height,
+                uint8_t* src_data[4];
+                int      src_ls[4];
+                crop_offsets(dec_frame, src_data, src_ls);
+                sws_scale(sws, src_data, src_ls, 0, crop_h,
                           enc_frame->data, enc_frame->linesize);
             }
             enc_frame->pts = v_pts_count++;

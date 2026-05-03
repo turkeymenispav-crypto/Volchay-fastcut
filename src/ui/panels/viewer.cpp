@@ -153,7 +153,10 @@ float draw_toolbar(EditorContext& ctx, float width, bool floating) {
 void draw_viewer(EditorContext& ctx) {
     const bool fullscreen = ctx.fullscreen && *ctx.fullscreen;
 
-    // Window setup.
+    // Window setup. We use a SEPARATE window when fullscreen so the
+    // docked "Viewer" panel keeps its place in the dockspace and
+    // re-appears cleanly when fullscreen is toggled off (otherwise
+    // the NoDocking flag would un-dock the panel for good).
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     if (fullscreen) {
         ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -166,8 +169,9 @@ void draw_viewer(EditorContext& ctx) {
             | ImGuiWindowFlags_NoBringToFrontOnFocus
             | ImGuiWindowFlags_NoNavFocus | ImGuiWindowFlags_NoDocking
             | ImGuiWindowFlags_NoScrollbar
-            | ImGuiWindowFlags_NoScrollWithMouse;
-        ImGui::Begin("Viewer", nullptr, fs_flags);
+            | ImGuiWindowFlags_NoScrollWithMouse
+            | ImGuiWindowFlags_NoSavedSettings;
+        ImGui::Begin("Viewer##fullscreen", nullptr, fs_flags);
     } else {
         ImGui::Begin("Viewer", nullptr,
                      ImGuiWindowFlags_NoScrollbar

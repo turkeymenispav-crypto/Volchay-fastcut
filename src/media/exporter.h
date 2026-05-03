@@ -34,6 +34,10 @@ struct ExportRequest {
     int          video_bitrate = 12'000'000; // bps
     int          audio_bitrate = 192'000;    // bps
     bool         hardware      = true;       // try GPU encoder first
+    // Aspect-ratio override. When > 0, the source frame is centre-
+    // cropped to this ratio before scale + encode (matches the
+    // viewer's "AR:" combo). 0 = no crop, keep source aspect.
+    double       aspect_ratio  = 0.0;
     core::TimeUs trim_start_us = 0;
     core::TimeUs trim_end_us   = -1;         // -1 = full duration
 
