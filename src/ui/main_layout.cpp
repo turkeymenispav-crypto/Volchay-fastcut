@@ -1,5 +1,6 @@
 #include "ui/main_layout.h"
 
+#include "shell/registry.h"
 #include "ui/panels/export_panel.h"
 #include "ui/panels/inspector.h"
 #include "ui/panels/library.h"
@@ -62,6 +63,34 @@ void MainLayout::draw_menu_bar(EditorContext& ctx) {
         const bool can_export = ctx.player && ctx.player->is_open();
         if (ImGui::MenuItem("Export...", "Ctrl+E", false, can_export)) {
             if (ctx.show_export) *ctx.show_export = true;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem("Register context menu...")) {
+            LONG e = volchay::shell::register_context_menu(true);
+            wchar_t msg[256];
+            if (e == ERROR_SUCCESS) {
+                ::lstrcpyW(msg,
+                    L"Registered. Right-click any video file -> "
+                    L"'Open with Volchay-fastcut'.");
+                ::MessageBoxW(nullptr, msg, L"Volchay-fastcut",
+                              MB_ICONINFORMATION | MB_OK);
+            } else {
+                ::wsprintfW(msg, L"Failed (error %ld).", long(e));
+                ::MessageBoxW(nullptr, msg, L"Volchay-fastcut",
+                              MB_ICONERROR | MB_OK);
+            }
+        }
+        if (ImGui::MenuItem("Unregister context menu")) {
+            LONG e = volchay::shell::unregister_context_menu(true);
+            wchar_t msg[128];
+            if (e == ERROR_SUCCESS) {
+                ::MessageBoxW(nullptr, L"Unregistered.", L"Volchay-fastcut",
+                              MB_ICONINFORMATION | MB_OK);
+            } else {
+                ::wsprintfW(msg, L"Failed (error %ld).", long(e));
+                ::MessageBoxW(nullptr, msg, L"Volchay-fastcut",
+                              MB_ICONERROR | MB_OK);
+            }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Exit", "Alt+F4")) {
