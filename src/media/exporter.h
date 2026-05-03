@@ -36,6 +36,14 @@ struct ExportRequest {
     bool         hardware      = true;       // try GPU encoder first
     core::TimeUs trim_start_us = 0;
     core::TimeUs trim_end_us   = -1;         // -1 = full duration
+
+    // When replace_source is set the exporter writes to output_path
+    // (the caller is expected to make this a tmp file alongside the
+    // original) and on success the UI is responsible for swapping
+    // the temp file in for `replace_final_path` (deleting the
+    // original first). The exporter itself never deletes any file.
+    bool         replace_source     = false;
+    std::wstring replace_final_path;
 };
 
 // A small label library the UI uses to populate the codec / resolution
@@ -70,6 +78,13 @@ public:
     bool   succeeded() const { return success_.load(); }
     std::string status_text() const;
 
+    // Snapshot of the request that just finished (only valid when
+    // finished() is true). Used by the UI to know the source/temp/
+    // final paths after a replace_source export completes.
+    ExportRequest last_request() const;
+    void          mark_replaced();    // UI clears the replace flag after
+                                      // performing the swap.
+
 private:
     void worker_main();
     void run_one_export(ExportRequest req);
@@ -86,6 +101,7 @@ private:
     std::string                status_;
     ExportRequest              pending_;
     bool                       has_pending_ = false;
+    ExportRequest              last_;
 };
 
 }  // namespace volchay::media

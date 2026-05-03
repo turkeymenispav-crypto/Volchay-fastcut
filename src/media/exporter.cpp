@@ -113,6 +113,17 @@ std::string Exporter::status_text() const {
     return status_;
 }
 
+ExportRequest Exporter::last_request() const {
+    std::lock_guard lk(const_cast<std::mutex&>(mu_));
+    return last_;
+}
+
+void Exporter::mark_replaced() {
+    std::lock_guard lk(mu_);
+    last_.replace_source = false;
+    last_.replace_final_path.clear();
+}
+
 void Exporter::worker_main() {
     while (!quit_.load()) {
         ExportRequest req;
@@ -127,6 +138,10 @@ void Exporter::worker_main() {
         }
         if (have) {
             run_one_export(req);
+            {
+                std::lock_guard lk(mu_);
+                last_ = req;
+            }
             busy_.store(false);
             finished_.store(true);
         } else {

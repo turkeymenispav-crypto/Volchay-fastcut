@@ -218,12 +218,11 @@ void draw_export(EditorContext& ctx) {
             ImGui::Separator();
             ImGui::Spacing();
 
-            ImGui::BeginDisabled(!can_export);
-            if (ImGui::Button("Start export", ImVec2(160, 0))) {
-                media::ExportRequest r;
+            // Helper that fills an ExportRequest from the current
+            // dialog state, except the paths (caller sets those).
+            auto build_request = [&](media::ExportRequest& r) {
                 r.source_path = ctx.player ? ctx.player->source_path()
                                            : std::wstring{};
-                r.output_path = volchay::widen(dest_buf);
                 r.codec = (codec_idx == 1) ? media::ExportCodec::HEVC
                                            : media::ExportCodec::H264;
                 if (resolution_idx == 5) {
@@ -245,7 +244,45 @@ void draw_export(EditorContext& ctx) {
                 r.hardware      = hardware;
                 r.trim_start_us = export_src_in;
                 r.trim_end_us   = export_src_out;
+            };
+
+            ImGui::BeginDisabled(!can_export);
+            if (ImGui::Button("Start export", ImVec2(160, 0))) {
+                media::ExportRequest r;
+                build_request(r);
+                r.output_path = volchay::widen(dest_buf);
                 ex.start(r);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            const bool can_replace = ctx.player && ctx.player->is_open();
+            ImGui::BeginDisabled(!can_replace);
+            if (ImGui::Button("Replace source video", ImVec2(180, 0))) {
+                int yn = ::MessageBoxW(nullptr,
+                    L"This will export over the original source file.\n"
+                    L"The original will be moved to a .bak next to it,\n"
+                    L"then deleted only after the export succeeds.\n\n"
+                    L"Continue?",
+                    L"Replace source video",
+                    MB_ICONWARNING | MB_YESNO);
+                if (yn == IDYES) {
+                    media::ExportRequest r;
+                    build_request(r);
+                    // Build temp path "<source>.export.tmp.mp4" and
+                    // final path "<source-without-ext>.mp4".
+                    std::wstring src = ctx.player->source_path();
+                    std::wstring final_path = src;
+                    size_t dot = final_path.find_last_of(L'.');
+                    if (dot != std::wstring::npos
+                        && final_path.find_last_of(L"\\/") < dot) {
+                        final_path.resize(dot);
+                    }
+                    final_path += L".mp4";
+                    r.output_path        = src + L".export.tmp.mp4";
+                    r.replace_source     = true;
+                    r.replace_final_path = final_path;
+                    ex.start(r);
+                }
             }
             ImGui::EndDisabled();
             ImGui::SameLine();
@@ -271,9 +308,41 @@ void draw_export(EditorContext& ctx) {
 
         if (ex.finished()) {
             ImGui::Spacing();
+            const auto last = ex.last_request();
             if (ex.succeeded()) {
-                ImGui::TextColored(theme().accent, "Export finished.");
+                // If this was a "Replace source" export, perform the
+                // file swap on the UI thread (player must be closed
+                // before we can delete/rename the source file).
+                if (last.replace_source && !last.replace_final_path.empty()) {
+                    if (ctx.player) ctx.player->close();
+                    ::DeleteFileW(last.source_path.c_str());
+                    BOOL ok = ::MoveFileExW(last.output_path.c_str(),
+                                            last.replace_final_path.c_str(),
+                                            MOVEFILE_REPLACE_EXISTING);
+                    ex.mark_replaced();
+                    if (ok && ctx.open_file) {
+                        ctx.open_file(last.replace_final_path);
+                        ImGui::TextColored(theme().accent,
+                            "Source video replaced.");
+                    } else if (!ok) {
+                        wchar_t buf[256];
+                        ::wsprintfW(buf,
+                            L"Replace failed: MoveFileEx error %lu.",
+                            ::GetLastError());
+                        ::MessageBoxW(nullptr, buf, L"Volchay-fastcut",
+                                      MB_ICONERROR | MB_OK);
+                        ImGui::TextColored(theme().timeline_playhead,
+                            "Export ok, but file swap failed.");
+                    }
+                } else {
+                    ImGui::TextColored(theme().accent, "Export finished.");
+                }
             } else {
+                // On failure of a replace-export, clean up the temp file.
+                if (last.replace_source && !last.output_path.empty()) {
+                    ::DeleteFileW(last.output_path.c_str());
+                    ex.mark_replaced();
+                }
                 ImGui::TextColored(theme().timeline_playhead,
                                    "Export failed: %s",
                                    ex.status_text().c_str());
