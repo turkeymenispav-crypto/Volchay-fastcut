@@ -59,6 +59,11 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR cmdline, int show_cmd) {
         app.open_initial_video(initial_path);
     }
 
+    // Lock the cold-start value before entering the main loop so the
+    // status bar shows a constant launch time, not the running session
+    // wall-clock.
+    trace.freeze();
+
     int exit_code = app.run();
 
     ::CoUninitialize();
