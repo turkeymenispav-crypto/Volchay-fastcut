@@ -2,6 +2,7 @@
 
 #include "core/clip.h"
 #include "core/project.h"
+#include "media/audio_player.h"
 #include "media/exporter.h"
 #include "ui/theme.h"
 
@@ -314,6 +315,10 @@ void draw_export(EditorContext& ctx) {
                 // file swap on the UI thread (player must be closed
                 // before we can delete/rename the source file).
                 if (last.replace_source && !last.replace_final_path.empty()) {
+                    // Both decoders own their own AVFormatContext on the
+                    // source file, so both must release it before we can
+                    // delete/move it on disk.
+                    if (ctx.audio)  ctx.audio->close();
                     if (ctx.player) ctx.player->close();
                     ::DeleteFileW(last.source_path.c_str());
                     BOOL ok = ::MoveFileExW(last.output_path.c_str(),

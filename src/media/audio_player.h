@@ -67,6 +67,7 @@ private:
     std::atomic<bool>       quit_{false};
     std::atomic<bool>       playing_{false};
     std::atomic<bool>       has_audio_{false};
+    std::atomic<bool>       file_open_{false};
     std::atomic<bool>       muted_{false};
     std::atomic<float>      volume_{1.0f};
     std::atomic<core::TimeUs> seek_target_{-1};

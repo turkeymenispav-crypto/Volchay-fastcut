@@ -19,7 +19,9 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #ifdef __MINGW32__
@@ -356,6 +358,13 @@ void AudioPlayer::close() {
         open_requested_  = false;
     }
     cv_.notify_all();
+    // Block until the worker has actually released the file. Without
+    // this, callers that try to delete/rename the source right after
+    // close() (e.g. the "Replace source" export) race the worker and
+    // hit ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED.
+    for (int i = 0; i < 1000 && file_open_.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 void AudioPlayer::play()             { playing_.store(true);  cv_.notify_all(); }
@@ -401,6 +410,7 @@ void AudioPlayer::worker_main() {
             has_audio_.store(false);
             current_pts_us_.store(-1);
             duration_us_.store(0);
+            file_open_.store(false);
         }
 
         if (do_open) {
@@ -435,8 +445,10 @@ void AudioPlayer::worker_main() {
                 release_decoder(w);
                 w.dev.reset();
                 has_audio_.store(false);
+                file_open_.store(false);
                 continue;
             }
+            file_open_.store(true);
 
             // Compute duration from av and stash.
             AVStream* st = w.fmt_ctx->streams[w.audio_stream];
