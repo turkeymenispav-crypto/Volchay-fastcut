@@ -165,14 +165,6 @@ void MainLayout::draw_status_strip(EditorContext& ctx) {
         ImGui::TextColored(theme().text_dim, "Up:");
         ImGui::SameLine();
         ImGui::Text("%.1fs", ctx.session_seconds);
-
-        // Right-aligned cold-start time.
-        char buf[64];
-        ::snprintf(buf, sizeof(buf), "Cold start %.0f ms",
-                   ctx.startup ? ctx.startup->total_millis() : 0.0);
-        const float w = ImGui::CalcTextSize(buf).x + 16.0f;
-        ImGui::SameLine(ImGui::GetContentRegionAvail().x - w + ImGui::GetCursorPosX());
-        ImGui::TextColored(theme().accent, "%s", buf);
     }
     ImGui::End();
     ImGui::PopStyleColor();
