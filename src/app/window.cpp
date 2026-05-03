@@ -119,6 +119,15 @@ bool Window::create(int width, int height, const wchar_t* title) {
 
 void Window::show(int show_cmd) {
     if (!hwnd_) return;
+    // Always launch maximised so the dock layout has room for the
+    // Library / Viewer / Inspector / Timeline panels at any monitor
+    // size. The shell-supplied show_cmd is preserved as a fallback if
+    // the user explicitly requested a hidden / minimised launch.
+    if (show_cmd != SW_HIDE && show_cmd != SW_MINIMIZE
+        && show_cmd != SW_SHOWMINNOACTIVE
+        && show_cmd != SW_SHOWMINIMIZED) {
+        show_cmd = SW_SHOWMAXIMIZED;
+    }
     ::ShowWindow(hwnd_, show_cmd);
     ::UpdateWindow(hwnd_);
 }
