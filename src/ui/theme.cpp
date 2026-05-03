@@ -18,21 +18,25 @@ void apply_theme() {
     s.PopupRounding     = t.corner_radius;
     s.ScrollbarRounding = t.corner_radius;
     s.GrabRounding      = t.corner_radius;
-    s.TabRounding       = 4.0f;
+    s.TabRounding       = t.corner_radius;
 
     s.WindowBorderSize  = 0.0f;
     s.ChildBorderSize   = 0.0f;
     s.FrameBorderSize   = 0.0f;
     s.TabBorderSize     = 0.0f;
     s.PopupBorderSize   = 1.0f;
+    s.SeparatorTextBorderSize = 1.0f;
 
-    s.WindowPadding     = ImVec2(10, 10);
-    s.FramePadding      = ImVec2(8, t.frame_padding_y);
-    s.ItemSpacing       = ImVec2(8, t.item_spacing_y);
-    s.ItemInnerSpacing  = ImVec2(6, 4);
-    s.IndentSpacing     = 16;
-    s.ScrollbarSize     = 12;
-    s.GrabMinSize       = 10;
+    s.WindowPadding     = ImVec2(12, 12);
+    s.FramePadding      = ImVec2(10, t.frame_padding_y);
+    s.ItemSpacing       = ImVec2(9, t.item_spacing_y);
+    s.ItemInnerSpacing  = ImVec2(6, 5);
+    s.CellPadding       = ImVec2(8, 5);
+    s.IndentSpacing     = 18;
+    s.ScrollbarSize     = 11;
+    s.GrabMinSize       = 12;
+    s.WindowTitleAlign  = ImVec2(0.0f, 0.5f);
+    s.SelectableTextAlign = ImVec2(0.0f, 0.5f);
 
     // Colors.
     auto C = [&](ImGuiCol idx, ImVec4 c) { s.Colors[idx] = c; };
