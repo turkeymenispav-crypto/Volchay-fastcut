@@ -126,8 +126,16 @@ void MainLayout::draw_menu_bar(EditorContext& ctx) {
 }
 
 void MainLayout::draw_status_strip(EditorContext& ctx) {
+    // Tight strip: just text height plus a couple of pixels of breathing
+    // room on each side. Don't use GetFrameHeight() here — that's the
+    // height of a button (text + 2*frame_padding_y) and the surrounding
+    // WindowPadding then crops the actual text. Compute the strip
+    // height ourselves and push a small WindowPadding so every pixel
+    // is usable.
+    const float text_h    = ImGui::GetTextLineHeight();
+    const float pad_y     = 4.0f;
+    const float h         = text_h + 2.0f * pad_y;
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float h = ImGui::GetFrameHeight();
     ImGui::SetNextWindowPos (ImVec2(vp->WorkPos.x,
                                     vp->WorkPos.y + vp->WorkSize.y - h));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, h));
@@ -137,9 +145,11 @@ void MainLayout::draw_status_strip(EditorContext& ctx) {
                            | ImGuiWindowFlags_NoMove
                            | ImGuiWindowFlags_NoSavedSettings
                            | ImGuiWindowFlags_NoBringToFrontOnFocus
+                           | ImGuiWindowFlags_NoScrollbar
                            | ImGuiWindowFlags_NoNav;
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, theme().bg_panel_alt);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12, pad_y));
     if (ImGui::Begin("##StatusStrip", nullptr, flags)) {
         ImGui::AlignTextToFramePadding();
 
@@ -167,14 +177,18 @@ void MainLayout::draw_status_strip(EditorContext& ctx) {
         ImGui::Text("%.1fs", ctx.session_seconds);
     }
     ImGui::End();
+    ImGui::PopStyleVar();
     ImGui::PopStyleColor();
 }
 
 void MainLayout::render(EditorContext& ctx) {
     // Host window covers the entire viewport with a dock space, leaving
-    // room above for the menu bar and below for the status strip.
+    // room above for the menu bar and below for the status strip. The
+    // status strip height MUST match draw_status_strip() exactly so the
+    // dockspace doesn't end up overlapping it (or leave a gap that
+    // shows the underlying clear colour as a horizontal stripe).
     ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float status_h = ImGui::GetFrameHeight();
+    const float status_h = ImGui::GetTextLineHeight() + 8.0f;  // text_h + 2*pad_y
 
     ImGui::SetNextWindowPos (ImVec2(vp->WorkPos.x,  vp->WorkPos.y));
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, vp->WorkSize.y - status_h));
