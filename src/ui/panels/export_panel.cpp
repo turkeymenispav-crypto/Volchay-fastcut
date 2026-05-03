@@ -140,17 +140,58 @@ void draw_export(EditorContext& ctx) {
     // Bigger panel + chubby paddings inside. The form lives on a
     // single column where every label is centred and every input
     // spans the full content width — closer to a wizard / settings
-    // sheet than a debug tool window.
+    // sheet than a debug tool window. We render our own title row
+    // (and our own close button) because ImGui's default close X
+    // is fixed at one font-size square — far too small to hit
+    // comfortably.
     ImGui::SetNextWindowSize(ImVec2(560, 720), ImGuiCond_FirstUseEver);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28, 24));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28, 18));
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(12, 9));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(10, 10));
-    if (ImGui::Begin("Export", ctx.show_export, ImGuiWindowFlags_NoCollapse)) {
+
+    ImGuiWindowFlags export_flags = ImGuiWindowFlags_NoCollapse
+                                  | ImGuiWindowFlags_NoTitleBar;
+    if (ImGui::Begin("Export", nullptr, export_flags)) {
         media::Exporter& ex = *ctx.exporter;
         const bool busy = ex.busy();
 
-        // Title.
-        center_text(theme().text, "Export video");
+        // Custom title row: title text on the left, prominent close
+        // button on the right.
+        {
+            const float row_h = 36.0f;
+            const ImVec2 cursor_start = ImGui::GetCursorPos();
+            const float row_w = ImGui::GetContentRegionAvail().x;
+
+            // Big circular close button on the right. ~36×36 hit
+            // area, accent-tinted on hover so it's obviously
+            // interactive.
+            const float btn_sz = row_h;
+            ImGui::SetCursorPos(ImVec2(
+                cursor_start.x + row_w - btn_sz, cursor_start.y));
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, btn_sz * 0.5f);
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                ImVec4(theme().bg_button.x, theme().bg_button.y,
+                       theme().bg_button.z, 0.0f));   // transparent idle
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+                ImVec4(0.95f, 0.30f, 0.30f, 1.0f));   // red on hover
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+                ImVec4(0.80f, 0.20f, 0.20f, 1.0f));
+            if (ImGui::Button("X##export-close", ImVec2(btn_sz, btn_sz))) {
+                if (ctx.show_export) *ctx.show_export = false;
+            }
+            ImGui::PopStyleColor(3);
+            ImGui::PopStyleVar();
+
+            // Title text centred vertically with the close button.
+            ImGui::SetCursorPos(cursor_start);
+            ImGui::Dummy(ImVec2(0, (row_h - ImGui::GetTextLineHeight()) * 0.5f));
+            center_text(theme().text, "Export video");
+
+            // Move cursor to below the row.
+            ImGui::SetCursorPos(ImVec2(cursor_start.x,
+                cursor_start.y + row_h + 6.0f));
+        }
+        ImGui::Separator();
         ImGui::Spacing();
 
         if (!busy) {
