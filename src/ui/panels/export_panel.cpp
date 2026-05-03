@@ -320,24 +320,85 @@ void draw_export(EditorContext& ctx) {
                     // delete/move it on disk.
                     if (ctx.audio)  ctx.audio->close();
                     if (ctx.player) ctx.player->close();
-                    ::DeleteFileW(last.source_path.c_str());
-                    BOOL ok = ::MoveFileExW(last.output_path.c_str(),
-                                            last.replace_final_path.c_str(),
-                                            MOVEFILE_REPLACE_EXISTING);
+
+                    // Helper: retry a fileop while the OS still has
+                    // the file held (Defender scan, Explorer thumbnail
+                    // pane, indexing service, etc.). 6 seconds total.
+                    auto retry = [](auto&& op) -> DWORD {
+                        for (int i = 0; i < 60; ++i) {
+                            if (op()) return 0;
+                            DWORD e = ::GetLastError();
+                            if (e != ERROR_ACCESS_DENIED
+                             && e != ERROR_SHARING_VIOLATION
+                             && e != ERROR_FILE_NOT_FOUND) return e;
+                            ::Sleep(100);
+                        }
+                        return ::GetLastError();
+                    };
+
+                    DWORD err = 0;
+                    if (last.source_path == last.replace_final_path) {
+                        // Same path: rename source out of the way
+                        // first, then move temp into place. If the
+                        // second step works, drop the backup.
+                        std::wstring bak = last.source_path + L".bak";
+                        ::DeleteFileW(bak.c_str());
+                        err = retry([&] {
+                            return ::MoveFileExW(last.source_path.c_str(),
+                                bak.c_str(), MOVEFILE_REPLACE_EXISTING);
+                        });
+                        if (!err) {
+                            err = retry([&] {
+                                return ::MoveFileExW(last.output_path.c_str(),
+                                    last.replace_final_path.c_str(),
+                                    MOVEFILE_REPLACE_EXISTING);
+                            });
+                            if (err) {
+                                // Roll back: restore the original.
+                                ::MoveFileExW(bak.c_str(),
+                                    last.source_path.c_str(),
+                                    MOVEFILE_REPLACE_EXISTING);
+                            } else {
+                                ::DeleteFileW(bak.c_str());
+                            }
+                        }
+                    } else {
+                        // Different paths (e.g. .mov source -> .mp4
+                        // final). Move new file into place first, then
+                        // delete the original. That way a transient
+                        // lock on the source doesn't lose work.
+                        err = retry([&] {
+                            return ::MoveFileExW(last.output_path.c_str(),
+                                last.replace_final_path.c_str(),
+                                MOVEFILE_REPLACE_EXISTING);
+                        });
+                        if (!err) {
+                            retry([&] {
+                                return ::DeleteFileW(
+                                    last.source_path.c_str());
+                            });
+                        }
+                    }
                     ex.mark_replaced();
-                    if (ok && ctx.open_file) {
+                    if (!err && ctx.open_file) {
                         ctx.open_file(last.replace_final_path);
                         ImGui::TextColored(theme().accent,
                             "Source video replaced.");
-                    } else if (!ok) {
+                    } else if (err) {
                         wchar_t buf[256];
                         ::wsprintfW(buf,
-                            L"Replace failed: MoveFileEx error %lu.",
-                            ::GetLastError());
+                            L"Replace failed: file is locked by "
+                            L"another process (Win32 error %lu).\n"
+                            L"Close any video previewer / antivirus "
+                            L"scan and try again.",
+                            err);
                         ::MessageBoxW(nullptr, buf, L"Volchay-fastcut",
                                       MB_ICONERROR | MB_OK);
                         ImGui::TextColored(theme().timeline_playhead,
                             "Export ok, but file swap failed.");
+                        // Reopen the original so the user isn't left
+                        // with a closed editor session.
+                        if (ctx.open_file) ctx.open_file(last.source_path);
                     }
                 } else {
                     ImGui::TextColored(theme().accent, "Export finished.");
