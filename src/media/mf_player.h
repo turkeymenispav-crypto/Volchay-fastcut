@@ -129,6 +129,7 @@ private:
     int               video_stream_= -1;
     int64_t           ts_offset_   = 0;   // av timebase rebased to 0
     core::TimeUs      worker_pts_  = -1;
+    bool              first_frame_logged_ = false;  // log "First frame decoded" once per open, not per seek
 
     // D3D11 (device + texture are thread-safe to create).
     ComPtr<ID3D11Device>              device_;

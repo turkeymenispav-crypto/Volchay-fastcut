@@ -1,33 +1,81 @@
+// FFmpeg/libav-based exporter.
+//
+// Reads the open file via libavformat (which gave us a working AV1 +
+// HEVC decode path for preview), re-encodes video to H.264 or HEVC and
+// audio to AAC, muxes into .mp4. The previous IMFSinkWriter version
+// kept failing on `WriteSample(video) hr=0x80070057` for AV1 sources
+// regardless of the negotiated NV12 input type.
+//
+// Encoder selection: we try the GPU encoders first (h264_nvenc /
+// h264_qsv / h264_amf / h264_mf, and the hevc equivalents), then fall
+// back to the openh264 software encoder. Whatever the user passed for
+// req.hardware is honoured as a preference, but if the GPU-resident
+// encoders aren't present in the BtbN LGPL build (or aren't available
+// on this hardware) the exporter still finishes via software.
 #include "media/exporter.h"
 
-#include "media/mf_extras.h"
-#include "util/com_ptr.h"
 #include "util/log.h"
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/rational.h>
+#include <libswresample/swresample.h>
+#include <libswscale/swscale.h>
+}
+
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <string>
 
 namespace volchay::media {
 
-using volchay::ComPtr;
-
+// Display-only labels for the dialog's "Quick presets" list. The
+// underlying ExportRequest fields are what the encoder actually sees;
+// these just pre-fill them.
 const ExportPreset kPresets[] = {
-    {"H.264 1080p / 12 Mbps",         1920, 1080, 12'000'000, 60, 1, false},
-    {"H.264 1080p / 8 Mbps  (web)",   1920, 1080,  8'000'000, 60, 1, false},
-    {"H.264 4K   / 35 Mbps",          3840, 2160, 35'000'000, 60, 1, false},
-    {"HEVC 4K HDR / 50 Mbps",         3840, 2160, 50'000'000, 60, 1, true},
+    {"H.264 1080p / 12 Mbps",         1920, 1080, 12'000'000, 0, 1, false},
+    {"H.264 1080p / 8 Mbps  (web)",   1920, 1080,  8'000'000, 0, 1, false},
+    {"H.264 4K   / 35 Mbps",          3840, 2160, 35'000'000, 0, 1, false},
+    {"HEVC 4K HDR / 50 Mbps",         3840, 2160, 50'000'000, 0, 1, true},
     {"H.264 720p / 5 Mbps  (mobile)", 1280,  720,  5'000'000, 30, 1, false},
 };
 const int kPresetCount = int(sizeof(kPresets) / sizeof(kPresets[0]));
 
 namespace {
-LONGLONG us_to_mftime(core::TimeUs us) { return LONGLONG(us) * 10; }
 
-// Map the user-supplied bitrate at the chosen preset's resolution onto a
-// reasonable BlockAlignment / GOP for H.264.
-GUID encoder_subtype(bool hevc) {
-    return hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264;
+std::string averr(int err) {
+    char buf[AV_ERROR_MAX_STRING_SIZE]{};
+    av_strerror(err, buf, sizeof(buf));
+    return std::string(buf);
 }
+
+std::string narrow_path(const std::wstring& w) {
+    int sz = ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()),
+                                   nullptr, 0, nullptr, nullptr);
+    std::string out(sz, 0);
+    ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), int(w.size()),
+                          out.data(), sz, nullptr, nullptr);
+    return out;
+}
+
+// Encoder lookup helper. Tries the named encoders in order and returns
+// the first one that exists in this libavcodec build.
+const AVCodec* find_encoder(const char* const* names, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        if (!names[i]) continue;
+        const AVCodec* c = avcodec_find_encoder_by_name(names[i]);
+        if (c) return c;
+    }
+    return nullptr;
+}
+
 }  // namespace
 
 Exporter::Exporter() {
@@ -66,8 +114,6 @@ std::string Exporter::status_text() const {
 }
 
 void Exporter::worker_main() {
-    HRESULT init = ::CoInitializeEx(nullptr,
-                                    COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE);
     while (!quit_.load()) {
         ExportRequest req;
         bool         have = false;
@@ -87,7 +133,6 @@ void Exporter::worker_main() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
-    if (SUCCEEDED(init)) ::CoUninitialize();
 }
 
 void Exporter::run_one_export(ExportRequest req) {
@@ -95,335 +140,541 @@ void Exporter::run_one_export(ExportRequest req) {
         std::lock_guard lk(mu_);
         status_ = std::move(s);
     };
-    set_status("Preparing source...");
 
-    if (req.preset_index < 0 || req.preset_index >= kPresetCount) {
-        set_status("Invalid preset");
-        success_.store(false);
+    set_status("Opening source...");
+
+    // ------------------------------------------------------------------
+    // Input demuxer + decoders.
+    // ------------------------------------------------------------------
+    AVFormatContext* in_fmt = nullptr;
+    int err = avformat_open_input(&in_fmt, narrow_path(req.source_path).c_str(),
+                                  nullptr, nullptr);
+    if (err < 0) {
+        set_status("Cannot open source: " + averr(err));
         return;
     }
-    const ExportPreset& p = kPresets[req.preset_index];
-
-    HRESULT hr = ::MFStartup(MF_VERSION, MFSTARTUP_LITE);
-    if (FAILED(hr)) {
-        set_status("MFStartup failed");
+    err = avformat_find_stream_info(in_fmt, nullptr);
+    if (err < 0) {
+        set_status("Cannot probe streams: " + averr(err));
+        avformat_close_input(&in_fmt);
         return;
     }
 
-    // Source reader on the input. With ENABLE_HARDWARE_TRANSFORMS set,
-    // MF picks the GPU-resident H.264/HEVC decoder MFT when one is
-    // available — on a 4060 that means NVDEC for input.
-    ComPtr<IMFAttributes> src_attrs;
-    ::MFCreateAttributes(src_attrs.put(), 4);
-    // Match the player: do NOT set ENABLE_ADVANCED_VIDEO_PROCESSING.
-    // It's been observed to make MFCreateSourceReaderFromURL fail with
-    // E_INVALIDARG on some Windows 11 + GPU driver combinations.
-    src_attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
-    src_attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-                         req.hardware ? TRUE : FALSE);
-    src_attrs->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA,
-                         req.hardware ? FALSE : TRUE);
-
-    ComPtr<IMFSourceReader> src;
-    hr = ::MFCreateSourceReaderFromURL(req.source_path.c_str(), src_attrs.get(),
-                                       src.put());
-    if (FAILED(hr)) {
-        set_status("Cannot open source");
-        ::MFShutdown();
+    int v_in_idx = av_find_best_stream(in_fmt, AVMEDIA_TYPE_VIDEO,
+                                       -1, -1, nullptr, 0);
+    int a_in_idx = av_find_best_stream(in_fmt, AVMEDIA_TYPE_AUDIO,
+                                       -1, -1, nullptr, 0);
+    if (v_in_idx < 0) {
+        set_status("Source has no video stream");
+        avformat_close_input(&in_fmt);
         return;
     }
-    src->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE);
-    src->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE);
-    bool source_has_audio =
-        SUCCEEDED(src->SetStreamSelection(MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-                                          TRUE));
 
-    // Probe the source's native video size + frame rate so we can set
-    // matching attributes on both the source-reader output type and the
-    // sink-writer output type. Without explicit size/fps the source
-    // reader silently keeps the decoder's default media type (or the
-    // partial NV12 type fails to negotiate), and the sink writer's H.264
-    // encoder rejects every frame — producing an audio-only .mp4.
-    UINT32 src_w = 0, src_h = 0, fps_num = 30, fps_den = 1;
-    {
-        ComPtr<IMFMediaType> native;
-        if (SUCCEEDED(src->GetNativeMediaType(
-                MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, native.put()))) {
-            ::MFGetAttributeSize (native.get(), MF_MT_FRAME_SIZE, &src_w, &src_h);
-            ::MFGetAttributeRatio(native.get(), MF_MT_FRAME_RATE,
-                                  &fps_num, &fps_den);
-        }
-    }
-    if (src_w == 0 || src_h == 0) {
-        set_status("Source has no readable video stream");
-        ::MFShutdown();
+    AVStream* v_in = in_fmt->streams[v_in_idx];
+    AVStream* a_in = (a_in_idx >= 0) ? in_fmt->streams[a_in_idx] : nullptr;
+
+    // Video decoder.
+    const AVCodec* v_dec = avcodec_find_decoder(v_in->codecpar->codec_id);
+    if (!v_dec) {
+        set_status("No decoder for input video codec");
+        avformat_close_input(&in_fmt);
         return;
     }
-    if (fps_num == 0) { fps_num = 30; fps_den = 1; }
-
-    // Force NV12 video at the source's native size + rate. The encoder
-    // negotiation will then succeed because the input type carries every
-    // attribute (subtype, frame size, frame rate, interlace) the H.264
-    // encoder needs.
-    {
-        ComPtr<IMFMediaType> wanted;
-        ::MFCreateMediaType(wanted.put());
-        wanted->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        wanted->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12);
-        wanted->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-        ::MFSetAttributeSize (wanted.get(), MF_MT_FRAME_SIZE,  src_w,   src_h);
-        ::MFSetAttributeRatio(wanted.get(), MF_MT_FRAME_RATE,  fps_num, fps_den);
-        ::MFSetAttributeRatio(wanted.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-        hr = src->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                      nullptr, wanted.get());
-        if (FAILED(hr)) {
-            set_status("Cannot set NV12 on source video stream");
-            ::MFShutdown();
-            return;
-        }
+    AVCodecContext* v_dec_ctx = avcodec_alloc_context3(v_dec);
+    avcodec_parameters_to_context(v_dec_ctx, v_in->codecpar);
+    v_dec_ctx->thread_count = 0;
+    err = avcodec_open2(v_dec_ctx, v_dec, nullptr);
+    if (err < 0) {
+        set_status("Open input video decoder failed: " + averr(err));
+        avcodec_free_context(&v_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
     }
-    if (source_has_audio) {
-        ComPtr<IMFMediaType> wanted;
-        ::MFCreateMediaType(wanted.put());
-        wanted->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        wanted->SetGUID(MF_MT_SUBTYPE,    MFAudioFormat_PCM);
-        wanted->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
-        wanted->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS,        2);
-        wanted->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE,     16);
-        wanted->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT,     4);
-        wanted->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 48000 * 4);
-        if (FAILED(src->SetCurrentMediaType(
-                MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, wanted.get()))) {
-            // No fatal: keep going without audio.
-            source_has_audio = false;
+
+    // Audio decoder.
+    AVCodecContext* a_dec_ctx = nullptr;
+    if (a_in) {
+        const AVCodec* a_dec = avcodec_find_decoder(a_in->codecpar->codec_id);
+        if (a_dec) {
+            a_dec_ctx = avcodec_alloc_context3(a_dec);
+            avcodec_parameters_to_context(a_dec_ctx, a_in->codecpar);
+            err = avcodec_open2(a_dec_ctx, a_dec, nullptr);
+            if (err < 0) {
+                avcodec_free_context(&a_dec_ctx);
+                a_dec_ctx = nullptr;
+                a_in = nullptr;
+            }
+        } else {
+            a_in = nullptr;
         }
     }
 
-    // Probe duration for progress reporting.
-    core::TimeUs total_us = 0;
-    {
-        PROPVARIANT pv;
-        ::PropVariantInit(&pv);
-        if (SUCCEEDED(src->GetPresentationAttribute(
-                MF_SOURCE_READER_MEDIASOURCE, MF_PD_DURATION, &pv))
-            && pv.vt == VT_UI8) {
-            total_us = core::TimeUs(pv.uhVal.QuadPart / 10);
-        }
-        ::PropVariantClear(&pv);
-    }
-    if (req.trim_end_us < 0 || req.trim_end_us > total_us) {
-        req.trim_end_us = total_us;
-    }
-    const core::TimeUs span_us = std::max<core::TimeUs>(
-        1, req.trim_end_us - req.trim_start_us);
+    // ------------------------------------------------------------------
+    // Output muxer + encoders.
+    // ------------------------------------------------------------------
+    set_status("Opening output...");
 
-    // Sink writer. The hardware-transform attribute is what actually
-    // routes the output through NVENC / Quick Sync / AMF; without it
-    // MF defaults to the Microsoft SW H.264 encoder which is ~30x
-    // slower than NVENC on a 4060.
-    ComPtr<IMFAttributes> sink_attrs;
-    ::MFCreateAttributes(sink_attrs.put(), 6);
-    sink_attrs->SetGUID  (MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
-    sink_attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS,
-                          req.hardware ? TRUE : FALSE);
-    sink_attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-    sink_attrs->SetUINT32(MF_LOW_LATENCY, FALSE);
-
-    ComPtr<IMFSinkWriter> sw;
-    hr = ::MFCreateSinkWriterFromURL(req.output_path.c_str(), nullptr,
-                                     sink_attrs.get(), sw.put());
-    if (FAILED(hr)) {
-        set_status("Cannot create output");
-        ::MFShutdown();
+    const std::string out_path = narrow_path(req.output_path);
+    AVFormatContext* out_fmt = nullptr;
+    err = avformat_alloc_output_context2(&out_fmt, nullptr, "mp4",
+                                         out_path.c_str());
+    if (err < 0 || !out_fmt) {
+        set_status("Cannot create output: " + averr(err));
+        avcodec_free_context(&v_dec_ctx);
+        if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
         return;
     }
 
-    // Output video type. We keep the source's native frame size + rate
-    // (preset.width/height/fps_* are intentionally ignored in V1) — that
-    // way the H.264 encoder sees matching input + output dimensions and
-    // doesn't need an inserted resizer MFT, which MF won't add
-    // automatically when driving SinkWriter directly. The preset still
-    // controls the bitrate and the H.264-vs-HEVC choice.
-    ComPtr<IMFMediaType> out_video;
-    ::MFCreateMediaType(out_video.put());
-    out_video->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    out_video->SetGUID(MF_MT_SUBTYPE,    encoder_subtype(p.prefer_hevc));
-    out_video->SetUINT32(MF_MT_AVG_BITRATE, UINT32(p.video_bitrate));
-    out_video->SetUINT32(MF_MT_INTERLACE_MODE,
-                         MFVideoInterlace_Progressive);
-    ::MFSetAttributeSize (out_video.get(), MF_MT_FRAME_SIZE,  src_w,   src_h);
-    ::MFSetAttributeRatio(out_video.get(), MF_MT_FRAME_RATE,  fps_num, fps_den);
-    ::MFSetAttributeRatio(out_video.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    // Pick the video encoder.
+    const char* h264_hw[] = { "h264_nvenc", "h264_qsv", "h264_amf", "h264_mf" };
+    const char* h264_sw[] = { "libopenh264", "h264" };
+    const char* hevc_hw[] = { "hevc_nvenc", "hevc_qsv", "hevc_amf", "hevc_mf" };
+    const char* hevc_sw[] = { "hevc", "libx265" };
 
-    DWORD video_idx = 0;
-    hr = sw->AddStream(out_video.get(), &video_idx);
-    if (FAILED(hr)) {
-        set_status("AddStream(video) failed (encoder unavailable?)");
-        log::err("Exporter: AddStream(video) hr=0x%08lx", (long)hr);
-        ::MFShutdown();
+    const AVCodec* v_enc = nullptr;
+    if (req.codec == ExportCodec::HEVC) {
+        if (req.hardware) v_enc = find_encoder(hevc_hw, sizeof(hevc_hw)/sizeof(*hevc_hw));
+        if (!v_enc)       v_enc = find_encoder(hevc_sw, sizeof(hevc_sw)/sizeof(*hevc_sw));
+        if (!v_enc)       v_enc = find_encoder(hevc_hw, sizeof(hevc_hw)/sizeof(*hevc_hw));
+    } else {
+        if (req.hardware) v_enc = find_encoder(h264_hw, sizeof(h264_hw)/sizeof(*h264_hw));
+        if (!v_enc)       v_enc = find_encoder(h264_sw, sizeof(h264_sw)/sizeof(*h264_sw));
+        if (!v_enc)       v_enc = find_encoder(h264_hw, sizeof(h264_hw)/sizeof(*h264_hw));
+    }
+    if (!v_enc) {
+        set_status(req.codec == ExportCodec::HEVC
+            ? "No HEVC encoder available in this libavcodec build"
+            : "No H.264 encoder available in this libavcodec build");
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&v_dec_ctx);
+        if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
         return;
     }
 
-    // Input video type. Build explicitly so we control MF_MT_DEFAULT_STRIDE
-    // and PIXEL_ASPECT_RATIO — the encoder validates samples against these
-    // and will reject WriteSample with E_INVALIDARG if they're missing or
-    // mismatch the actual sample stride (typical AV1 path: the source
-    // reader's NV12 output has a stride attribute we need to surface to
-    // the encoder).
-    ComPtr<IMFMediaType> reader_type;
-    hr = src->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                  reader_type.put());
-    if (FAILED(hr)) {
-        set_status("Source video type unavailable");
-        log::err("Exporter: GetCurrentMediaType(video) hr=0x%08lx", (long)hr);
-        ::MFShutdown();
+    AVCodecContext* v_enc_ctx = avcodec_alloc_context3(v_enc);
+    int out_w = (req.width  > 0) ? req.width  : v_dec_ctx->width;
+    int out_h = (req.height > 0) ? req.height : v_dec_ctx->height;
+    out_w &= ~1;          // even dimensions for h264/hevc
+    out_h &= ~1;
+    v_enc_ctx->width  = out_w;
+    v_enc_ctx->height = out_h;
+    v_enc_ctx->bit_rate = req.video_bitrate;
+    v_enc_ctx->pix_fmt  = AV_PIX_FMT_YUV420P;
+    AVRational out_tb;
+    if (req.fps_num > 0) {
+        out_tb = AVRational{req.fps_den, req.fps_num};
+    } else if (av_guess_frame_rate(in_fmt, v_in, nullptr).num > 0) {
+        AVRational fr = av_guess_frame_rate(in_fmt, v_in, nullptr);
+        out_tb = AVRational{fr.den, fr.num};
+    } else {
+        out_tb = AVRational{1, 30};
+    }
+    v_enc_ctx->time_base  = out_tb;
+    v_enc_ctx->framerate  = AVRational{out_tb.den, out_tb.num};
+    v_enc_ctx->gop_size   = std::max(1, v_enc_ctx->framerate.num * 2);
+    v_enc_ctx->max_b_frames = 2;
+    v_enc_ctx->sample_aspect_ratio = AVRational{1, 1};
+    if (out_fmt->oformat->flags & AVFMT_GLOBALHEADER) {
+        v_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+
+    // NVENC / QSV / AMF prefer NV12 input; the rest take YUV420P.
+    if (std::string(v_enc->name).find("nvenc") != std::string::npos
+     || std::string(v_enc->name).find("amf")   != std::string::npos
+     || std::string(v_enc->name).find("qsv")   != std::string::npos) {
+        v_enc_ctx->pix_fmt = AV_PIX_FMT_NV12;
+    }
+
+    AVDictionary* enc_opts = nullptr;
+    if (std::string(v_enc->name).find("nvenc") != std::string::npos) {
+        av_dict_set(&enc_opts, "preset", "p4", 0);
+        av_dict_set(&enc_opts, "tune",   "hq", 0);
+    }
+    err = avcodec_open2(v_enc_ctx, v_enc, &enc_opts);
+    av_dict_free(&enc_opts);
+    if (err < 0) {
+        set_status(std::string("Open ") + v_enc->name +
+                   " encoder failed: " + averr(err));
+        avcodec_free_context(&v_enc_ctx);
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&v_dec_ctx);
+        if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
         return;
     }
-    UINT32 reader_stride_u = UINT32(src_w);   // NV12 default stride = width
-    reader_type->GetUINT32(MF_MT_DEFAULT_STRIDE, &reader_stride_u);
+    log::info("Exporter: encoder = %s, %dx%d, %d kbps, %d/%d fps, pix=%s",
+              v_enc->name, out_w, out_h, req.video_bitrate / 1000,
+              v_enc_ctx->framerate.num, v_enc_ctx->framerate.den,
+              av_get_pix_fmt_name(v_enc_ctx->pix_fmt));
 
-    ComPtr<IMFMediaType> in_video;
-    ::MFCreateMediaType(in_video.put());
-    in_video->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    in_video->SetGUID(MF_MT_SUBTYPE,    MFVideoFormat_NV12);
-    in_video->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-    in_video->SetUINT32(MF_MT_DEFAULT_STRIDE, reader_stride_u);
-    ::MFSetAttributeSize (in_video.get(), MF_MT_FRAME_SIZE,  src_w,   src_h);
-    ::MFSetAttributeRatio(in_video.get(), MF_MT_FRAME_RATE,  fps_num, fps_den);
-    ::MFSetAttributeRatio(in_video.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-
-    hr = sw->SetInputMediaType(video_idx, in_video.get(), nullptr);
-    if (FAILED(hr)) {
-        set_status("Encoder rejected source video format");
-        log::err("Exporter: SetInputMediaType(video) hr=0x%08lx", (long)hr);
-        ::MFShutdown();
+    AVStream* v_out = avformat_new_stream(out_fmt, nullptr);
+    if (!v_out) {
+        set_status("avformat_new_stream(video) failed");
+        avcodec_free_context(&v_enc_ctx);
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&v_dec_ctx);
+        if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
         return;
     }
-    log::info("Exporter: input video set to NV12 %ux%u stride=%u @ %u/%u fps",
-              src_w, src_h, reader_stride_u, fps_num, fps_den);
+    avcodec_parameters_from_context(v_out->codecpar, v_enc_ctx);
+    v_out->time_base = v_enc_ctx->time_base;
 
-    // Audio.
-    DWORD audio_idx = (DWORD)-1;
-    if (source_has_audio) {
-        ComPtr<IMFMediaType> out_audio;
-        ::MFCreateMediaType(out_audio.put());
-        out_audio->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
-        out_audio->SetGUID(MF_MT_SUBTYPE,    MFAudioFormat_AAC);
-        out_audio->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
-        out_audio->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS,        2);
-        out_audio->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE,     16);
-        out_audio->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24'000);   // 192 kbps / 8
-        out_audio->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29);
-
-        if (SUCCEEDED(sw->AddStream(out_audio.get(), &audio_idx))) {
-            ComPtr<IMFMediaType> in_audio;
-            if (SUCCEEDED(src->GetCurrentMediaType(
-                    MF_SOURCE_READER_FIRST_AUDIO_STREAM, in_audio.put()))
-                && SUCCEEDED(sw->SetInputMediaType(audio_idx,
-                                                   in_audio.get(), nullptr))) {
-                // ok
+    // Audio encoder.
+    const AVCodec*    a_enc     = nullptr;
+    AVCodecContext*   a_enc_ctx = nullptr;
+    AVStream*         a_out     = nullptr;
+    SwrContext*       swr       = nullptr;
+    if (a_dec_ctx) {
+        a_enc = avcodec_find_encoder(AV_CODEC_ID_AAC);
+        if (a_enc) {
+            a_enc_ctx = avcodec_alloc_context3(a_enc);
+            a_enc_ctx->sample_rate = 48000;
+            a_enc_ctx->bit_rate    = req.audio_bitrate;
+            a_enc_ctx->sample_fmt  = AV_SAMPLE_FMT_FLTP;
+            av_channel_layout_default(&a_enc_ctx->ch_layout, 2);
+            a_enc_ctx->time_base   = AVRational{1, a_enc_ctx->sample_rate};
+            if (out_fmt->oformat->flags & AVFMT_GLOBALHEADER) {
+                a_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+            }
+            err = avcodec_open2(a_enc_ctx, a_enc, nullptr);
+            if (err < 0) {
+                log::warn("Exporter: AAC encoder open failed: %s",
+                          averr(err).c_str());
+                avcodec_free_context(&a_enc_ctx);
+                a_enc_ctx = nullptr;
             } else {
-                audio_idx = (DWORD)-1;
+                a_out = avformat_new_stream(out_fmt, nullptr);
+                avcodec_parameters_from_context(a_out->codecpar, a_enc_ctx);
+                a_out->time_base = a_enc_ctx->time_base;
+
+                // Set up resampler from decoder format -> encoder
+                // input format.
+                AVChannelLayout in_layout;
+                if (a_dec_ctx->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC) {
+                    av_channel_layout_copy(&in_layout, &a_dec_ctx->ch_layout);
+                } else {
+                    av_channel_layout_default(&in_layout,
+                        a_dec_ctx->ch_layout.nb_channels);
+                }
+                AVChannelLayout out_layout;
+                av_channel_layout_default(&out_layout, 2);
+                err = swr_alloc_set_opts2(&swr,
+                    &out_layout, a_enc_ctx->sample_fmt, a_enc_ctx->sample_rate,
+                    &in_layout,  a_dec_ctx->sample_fmt, a_dec_ctx->sample_rate,
+                    0, nullptr);
+                if (err < 0 || !swr || swr_init(swr) < 0) {
+                    if (swr) swr_free(&swr);
+                    avcodec_free_context(&a_enc_ctx);
+                    a_enc_ctx = nullptr;
+                    a_out = nullptr;
+                }
+                av_channel_layout_uninit(&in_layout);
+                av_channel_layout_uninit(&out_layout);
             }
         }
     }
 
-    hr = sw->BeginWriting();
-    if (FAILED(hr)) {
-        set_status("BeginWriting failed");
-        log::err("Exporter: BeginWriting hr=0x%08lx", (long)hr);
-        ::MFShutdown();
+    // ------------------------------------------------------------------
+    // Open output file & write header.
+    // ------------------------------------------------------------------
+    if (!(out_fmt->oformat->flags & AVFMT_NOFILE)) {
+        err = avio_open(&out_fmt->pb, out_path.c_str(), AVIO_FLAG_WRITE);
+        if (err < 0) {
+            set_status("avio_open failed: " + averr(err));
+            if (swr) swr_free(&swr);
+            if (a_enc_ctx) avcodec_free_context(&a_enc_ctx);
+            avcodec_free_context(&v_enc_ctx);
+            avformat_free_context(out_fmt);
+            avcodec_free_context(&v_dec_ctx);
+            if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+            avformat_close_input(&in_fmt);
+            return;
+        }
+    }
+    err = avformat_write_header(out_fmt, nullptr);
+    if (err < 0) {
+        set_status("write_header failed: " + averr(err));
+        if (out_fmt->pb) avio_closep(&out_fmt->pb);
+        if (swr) swr_free(&swr);
+        if (a_enc_ctx) avcodec_free_context(&a_enc_ctx);
+        avcodec_free_context(&v_enc_ctx);
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&v_dec_ctx);
+        if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
         return;
     }
 
     // Seek to trim start.
     if (req.trim_start_us > 0) {
-        PROPVARIANT pv;
-        ::PropVariantInit(&pv);
-        pv.vt = VT_I8;
-        pv.hVal.QuadPart = us_to_mftime(req.trim_start_us);
-        src->SetCurrentPosition(GUID_NULL, pv);
-        ::PropVariantClear(&pv);
+        int64_t seek_ts = av_rescale_q(req.trim_start_us,
+                                       AVRational{1, 1'000'000},
+                                       v_in->time_base);
+        av_seek_frame(in_fmt, v_in_idx, seek_ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(v_dec_ctx);
+        if (a_dec_ctx) avcodec_flush_buffers(a_dec_ctx);
     }
 
+    // Probe duration for progress.
+    int64_t total_us = 0;
+    if (in_fmt->duration != AV_NOPTS_VALUE) {
+        total_us = av_rescale_q(in_fmt->duration, AVRational{1, AV_TIME_BASE},
+                                AVRational{1, 1'000'000});
+    }
+    if (req.trim_end_us < 0 || req.trim_end_us > total_us) {
+        req.trim_end_us = total_us;
+    }
+    const int64_t span_us = std::max<int64_t>(
+        1, int64_t(req.trim_end_us) - int64_t(req.trim_start_us));
+
+    // ------------------------------------------------------------------
+    // Encode loop.
+    // ------------------------------------------------------------------
     set_status("Encoding...");
-    bool video_done = false, audio_done = (audio_idx == (DWORD)-1);
-    bool video_write_failed = false;
-    HRESULT first_video_err = S_OK;
-    UINT64 video_samples_written = 0;
 
-    while (!cancel_.load() && (!video_done || !audio_done)) {
-        DWORD stream = 0, flags = 0;
-        LONGLONG ts = 0;
-        ComPtr<IMFSample> sample;
+    SwsContext* sws = sws_getContext(
+        v_dec_ctx->width, v_dec_ctx->height, v_dec_ctx->pix_fmt,
+        out_w, out_h, v_enc_ctx->pix_fmt,
+        SWS_BILINEAR, nullptr, nullptr, nullptr);
 
-        if (!video_done) {
-            hr = src->ReadSample(MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0,
-                                 &stream, &flags, &ts, sample.put());
-            if (SUCCEEDED(hr) && sample) {
-                core::TimeUs pts = core::TimeUs(ts / 10);
-                if (pts > req.trim_end_us) {
-                    video_done = true;
-                } else {
-                    sample->SetSampleTime(us_to_mftime(pts - req.trim_start_us));
-                    HRESULT wh = sw->WriteSample(video_idx, sample.get());
-                    if (FAILED(wh)) {
-                        if (!video_write_failed) {
-                            first_video_err = wh;
-                            log::err("Exporter: WriteSample(video) hr=0x%08lx",
-                                     (long)wh);
-                        }
-                        video_write_failed = true;
-                    } else {
-                        ++video_samples_written;
-                    }
-                    progress_.store(float(double(pts - req.trim_start_us) /
-                                          double(span_us)));
-                }
-            }
-            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) video_done = true;
+    AVPacket* pkt        = av_packet_alloc();
+    AVPacket* enc_pkt    = av_packet_alloc();
+    AVFrame*  dec_frame  = av_frame_alloc();
+    AVFrame*  enc_frame  = av_frame_alloc();
+    AVFrame*  audio_frame= av_frame_alloc();
+
+    enc_frame->format = v_enc_ctx->pix_fmt;
+    enc_frame->width  = out_w;
+    enc_frame->height = out_h;
+    av_frame_get_buffer(enc_frame, 32);
+
+    int64_t v_pts_count = 0;
+    int64_t a_pts_count = 0;
+    int     a_frame_size = (a_enc_ctx ? a_enc_ctx->frame_size : 1024);
+
+    auto encode_video_frame = [&](AVFrame* f) -> int {
+        int rc = avcodec_send_frame(v_enc_ctx, f);
+        if (rc < 0 && rc != AVERROR(EAGAIN)) {
+            log::warn("Exporter: send video frame: %s", averr(rc).c_str());
+            return rc;
         }
+        while (true) {
+            rc = avcodec_receive_packet(v_enc_ctx, enc_pkt);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+            if (rc < 0) return rc;
+            enc_pkt->stream_index = v_out->index;
+            av_packet_rescale_ts(enc_pkt, v_enc_ctx->time_base,
+                                 v_out->time_base);
+            int wr = av_interleaved_write_frame(out_fmt, enc_pkt);
+            av_packet_unref(enc_pkt);
+            if (wr < 0) return wr;
+        }
+        return 0;
+    };
 
-        if (!audio_done) {
-            sample.reset();
-            hr = src->ReadSample(MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0,
-                                 &stream, &flags, &ts, sample.put());
-            if (SUCCEEDED(hr) && sample) {
-                core::TimeUs pts = core::TimeUs(ts / 10);
-                if (pts > req.trim_end_us) {
-                    audio_done = true;
-                } else {
-                    sample->SetSampleTime(us_to_mftime(pts - req.trim_start_us));
-                    sw->WriteSample(audio_idx, sample.get());
-                }
+    auto encode_audio_frame = [&](AVFrame* f) -> int {
+        if (!a_enc_ctx) return 0;
+        int rc = avcodec_send_frame(a_enc_ctx, f);
+        if (rc < 0 && rc != AVERROR(EAGAIN)) return rc;
+        while (true) {
+            rc = avcodec_receive_packet(a_enc_ctx, enc_pkt);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+            if (rc < 0) return rc;
+            enc_pkt->stream_index = a_out->index;
+            av_packet_rescale_ts(enc_pkt, a_enc_ctx->time_base,
+                                 a_out->time_base);
+            int wr = av_interleaved_write_frame(out_fmt, enc_pkt);
+            av_packet_unref(enc_pkt);
+            if (wr < 0) return wr;
+        }
+        return 0;
+    };
+
+    bool failed = false;
+    bool video_eof = false;
+    bool audio_eof = (a_enc_ctx == nullptr);
+
+    while (!cancel_.load() && (!video_eof || !audio_eof)) {
+        err = av_read_frame(in_fmt, pkt);
+        if (err < 0) break;
+
+        if (pkt->stream_index == v_in_idx && !video_eof) {
+            int rc = avcodec_send_packet(v_dec_ctx, pkt);
+            if (rc < 0 && rc != AVERROR(EAGAIN)) {
+                av_packet_unref(pkt);
+                continue;
             }
-            if (flags & MF_SOURCE_READERF_ENDOFSTREAM) audio_done = true;
+            while (true) {
+                rc = avcodec_receive_frame(v_dec_ctx, dec_frame);
+                if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+                if (rc < 0) { failed = true; break; }
+
+                int64_t pts_ts = (dec_frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                    ? dec_frame->best_effort_timestamp
+                    : dec_frame->pts;
+                int64_t pts_us = av_rescale_q(pts_ts, v_in->time_base,
+                                              AVRational{1, 1'000'000});
+                if (pts_us > req.trim_end_us) {
+                    video_eof = true;
+                    av_frame_unref(dec_frame);
+                    break;
+                }
+                progress_.store(float(double(pts_us - req.trim_start_us) /
+                                      double(span_us)));
+
+                // Convert + scale to encoder pix_fmt.
+                if (sws) {
+                    sws_scale(sws,
+                              dec_frame->data, dec_frame->linesize,
+                              0, dec_frame->height,
+                              enc_frame->data, enc_frame->linesize);
+                }
+                enc_frame->pts = v_pts_count++;
+                int rc2 = encode_video_frame(enc_frame);
+                if (rc2 < 0) failed = true;
+                av_frame_unref(dec_frame);
+            }
+        } else if (a_dec_ctx && pkt->stream_index == a_in_idx && !audio_eof) {
+            int rc = avcodec_send_packet(a_dec_ctx, pkt);
+            if (rc < 0 && rc != AVERROR(EAGAIN)) {
+                av_packet_unref(pkt);
+                continue;
+            }
+            while (true) {
+                rc = avcodec_receive_frame(a_dec_ctx, dec_frame);
+                if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+                if (rc < 0) { failed = true; break; }
+
+                int64_t pts_ts = (dec_frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                    ? dec_frame->best_effort_timestamp
+                    : dec_frame->pts;
+                int64_t pts_us = av_rescale_q(pts_ts, a_in->time_base,
+                                              AVRational{1, 1'000'000});
+                if (pts_us > req.trim_end_us) {
+                    audio_eof = true;
+                    av_frame_unref(dec_frame);
+                    break;
+                }
+
+                // swr converts directly into a fresh frame sized to
+                // the encoder's frame_size.
+                int max_out = int(av_rescale_rnd(
+                    swr_get_delay(swr, a_dec_ctx->sample_rate)
+                        + dec_frame->nb_samples,
+                    a_enc_ctx->sample_rate,
+                    a_dec_ctx->sample_rate, AV_ROUND_UP));
+
+                AVFrame* af = av_frame_alloc();
+                af->format         = a_enc_ctx->sample_fmt;
+                af->sample_rate    = a_enc_ctx->sample_rate;
+                af->nb_samples     = max_out;
+                av_channel_layout_copy(&af->ch_layout, &a_enc_ctx->ch_layout);
+                av_frame_get_buffer(af, 0);
+                int got = swr_convert(swr,
+                    af->data, max_out,
+                    (const uint8_t**)dec_frame->extended_data,
+                    dec_frame->nb_samples);
+                if (got > 0) {
+                    af->nb_samples = got;
+                    af->pts        = a_pts_count;
+                    a_pts_count   += got;
+                    int rc2 = encode_audio_frame(af);
+                    if (rc2 < 0) failed = true;
+                }
+                av_frame_free(&af);
+                av_frame_unref(dec_frame);
+            }
+        }
+        av_packet_unref(pkt);
+        if (failed) break;
+    }
+
+    // Flush decoders.
+    if (!cancel_.load() && !failed) {
+        avcodec_send_packet(v_dec_ctx, nullptr);
+        while (true) {
+            int rc = avcodec_receive_frame(v_dec_ctx, dec_frame);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+            if (rc < 0) break;
+            if (sws) {
+                sws_scale(sws, dec_frame->data, dec_frame->linesize,
+                          0, dec_frame->height,
+                          enc_frame->data, enc_frame->linesize);
+            }
+            enc_frame->pts = v_pts_count++;
+            encode_video_frame(enc_frame);
+            av_frame_unref(dec_frame);
+        }
+        if (a_dec_ctx) {
+            avcodec_send_packet(a_dec_ctx, nullptr);
+            while (true) {
+                int rc = avcodec_receive_frame(a_dec_ctx, dec_frame);
+                if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+                if (rc < 0) break;
+                int max_out = int(av_rescale_rnd(
+                    swr_get_delay(swr, a_dec_ctx->sample_rate)
+                        + dec_frame->nb_samples,
+                    a_enc_ctx->sample_rate,
+                    a_dec_ctx->sample_rate, AV_ROUND_UP));
+                AVFrame* af = av_frame_alloc();
+                af->format      = a_enc_ctx->sample_fmt;
+                af->sample_rate = a_enc_ctx->sample_rate;
+                af->nb_samples  = max_out;
+                av_channel_layout_copy(&af->ch_layout, &a_enc_ctx->ch_layout);
+                av_frame_get_buffer(af, 0);
+                int got = swr_convert(swr, af->data, max_out,
+                    (const uint8_t**)dec_frame->extended_data,
+                    dec_frame->nb_samples);
+                if (got > 0) {
+                    af->nb_samples = got;
+                    af->pts        = a_pts_count;
+                    a_pts_count   += got;
+                    encode_audio_frame(af);
+                }
+                av_frame_free(&af);
+                av_frame_unref(dec_frame);
+            }
         }
     }
+
+    // Flush encoders.
+    encode_video_frame(nullptr);
+    if (a_enc_ctx) encode_audio_frame(nullptr);
+
+    if (!failed && !cancel_.load()) {
+        av_write_trailer(out_fmt);
+    }
+
+    // Cleanup.
+    if (sws) sws_freeContext(sws);
+    av_packet_free(&pkt);
+    av_packet_free(&enc_pkt);
+    av_frame_free(&dec_frame);
+    av_frame_free(&enc_frame);
+    av_frame_free(&audio_frame);
+    if (swr) swr_free(&swr);
+    if (a_enc_ctx) avcodec_free_context(&a_enc_ctx);
+    avcodec_free_context(&v_enc_ctx);
+    if (out_fmt && out_fmt->pb) avio_closep(&out_fmt->pb);
+    if (out_fmt) avformat_free_context(out_fmt);
+    avcodec_free_context(&v_dec_ctx);
+    if (a_dec_ctx) avcodec_free_context(&a_dec_ctx);
+    avformat_close_input(&in_fmt);
 
     if (cancel_.load()) {
         set_status("Cancelled");
-        sw->Finalize();
         success_.store(false);
-    } else if (video_samples_written == 0) {
-        // No video frames made it past the encoder. Without this check
-        // the .mp4 would be finalized with an audio-only payload and the
-        // user would think "the export ran but my video is gone".
-        sw->Finalize();
-        char buf[96];
-        ::snprintf(buf, sizeof(buf),
-                   "Export failed: encoder rejected video (hr=0x%08lx)",
-                   (long)first_video_err);
-        set_status(buf);
-        log::err("%s", buf);
+    } else if (failed) {
+        set_status("Encoding failed");
         success_.store(false);
     } else {
-        sw->Finalize();
         progress_.store(1.0f);
         set_status("Done");
         success_.store(true);
     }
-    ::MFShutdown();
 }
 
 }  // namespace volchay::media

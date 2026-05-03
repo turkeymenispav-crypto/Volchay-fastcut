@@ -1,11 +1,7 @@
-// Export pipeline. Wraps IMFSinkWriter to transcode the open file (or
-// just its trim range) to an .mp4 using H.264, with hardware encoding
-// preferred (NVENC / Quick Sync / AMF) via the MF_TRANSCODE_TOPOLOGY_*
-// switches.
-//
-// V1 implementation: single-track passthrough — copies the input video's
-// resolution & frame rate, re-encodes to H.264 at the chosen bitrate.
-// Audio gets encoded with AAC LC at 192 kbps stereo if present.
+// FFmpeg/libav-based exporter. Reads the open file via libavformat,
+// re-encodes video (H.264 or HEVC, hardware preferred) and audio (AAC),
+// and muxes into .mp4. Replaces the previous IMFSinkWriter pipeline,
+// which was choking on AV1 + HEVC sources.
 //
 // Runs on its own worker thread; UI polls progress() and finished().
 #pragma once
@@ -20,11 +16,35 @@
 
 namespace volchay::media {
 
+enum class ExportCodec {
+    H264,
+    HEVC,
+};
+
+// All numeric resolution/fps/bitrate fields default to "source": copy
+// from the input. Set them non-zero to override.
+struct ExportRequest {
+    std::wstring source_path;
+    std::wstring output_path;
+    ExportCodec  codec         = ExportCodec::H264;
+    int          width         = 0;          // 0 = source
+    int          height        = 0;          // 0 = source
+    int          fps_num       = 0;          // 0 = source
+    int          fps_den       = 1;
+    int          video_bitrate = 12'000'000; // bps
+    int          audio_bitrate = 192'000;    // bps
+    bool         hardware      = true;       // try GPU encoder first
+    core::TimeUs trim_start_us = 0;
+    core::TimeUs trim_end_us   = -1;         // -1 = full duration
+};
+
+// A small label library the UI uses to populate the codec / resolution
+// / fps combos.
 struct ExportPreset {
     const char* label;
     int         width;
     int         height;
-    int         video_bitrate;     // bits per second.
+    int         video_bitrate;
     int         fps_num;
     int         fps_den;
     bool        prefer_hevc;
@@ -32,15 +52,6 @@ struct ExportPreset {
 
 extern const ExportPreset kPresets[];
 extern const int          kPresetCount;
-
-struct ExportRequest {
-    std::wstring source_path;
-    std::wstring output_path;
-    int          preset_index = 0;
-    bool         hardware     = true;
-    core::TimeUs trim_start_us = 0;
-    core::TimeUs trim_end_us   = -1;     // -1 = full duration
-};
 
 class Exporter {
 public:

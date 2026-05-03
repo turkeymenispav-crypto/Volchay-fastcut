@@ -391,6 +391,7 @@ bool MfPlayer::worker_open(const std::wstring& path) {
     }
     frame_ready_.store(false);
     worker_pts_ = -1;
+    first_frame_logged_ = false;
 
     log::info("FF stream: %dx%d @ %.3f fps, codec %s, pix_fmt %s, duration %.3fs",
               w, h, fps, dec->name,
@@ -416,6 +417,7 @@ void MfPlayer::worker_release_decoder() {
     duration_.store(0);
     hardware_decode_.store(false);
     worker_pts_ = -1;
+    first_frame_logged_ = false;
     ts_offset_  = 0;
 }
 
@@ -470,10 +472,10 @@ bool MfPlayer::worker_decode_one(core::TimeUs target_us) {
                 }
                 shared_buf_pts_ = pts;
             }
-            const bool first = (worker_pts_ < 0);
             worker_pts_ = pts;
             frame_ready_.store(true);
-            if (first) {
+            if (!first_frame_logged_) {
+                first_frame_logged_ = true;
                 log::info("First frame decoded (pts=%.3fs, %dx%d, %s)",
                           double(pts) / 1'000'000.0,
                           w, h,
