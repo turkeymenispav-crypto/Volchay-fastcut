@@ -359,6 +359,10 @@ void draw_export(EditorContext& ctx) {
                     r.xform_pos_x = c.pos_x;
                     r.xform_pos_y = c.pos_y;
                 }
+                // Hand the project to the exporter so multi-track and
+                // per-clip transforms can be composited into the
+                // encoded file.
+                r.project = ctx.project;
             };
 
             // Centered button row.

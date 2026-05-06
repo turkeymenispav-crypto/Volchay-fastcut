@@ -14,6 +14,8 @@
 #include <string>
 #include <thread>
 
+namespace volchay::core { class Project; }
+
 namespace volchay::media {
 
 enum class ExportCodec {
@@ -64,6 +66,13 @@ struct ExportRequest {
     float        xform_scale  = 1.0f;
     float        xform_pos_x  = 0.0f;
     float        xform_pos_y  = 0.0f;
+
+    // Project pointer. When set, the exporter walks the timeline at
+    // output FPS and composites every track + clip transform into the
+    // canvas (rather than re-encoding a single source). Audio is
+    // sourced from the lowest-track clip covering the trim range.
+    // Owned by the caller; must outlive the export.
+    const core::Project* project = nullptr;
 };
 
 // A small label library the UI uses to populate the codec / resolution
