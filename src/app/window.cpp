@@ -119,6 +119,15 @@ bool Window::create(int width, int height, const wchar_t* title) {
 
 void Window::show(int show_cmd) {
     if (!hwnd_) return;
+    // Always launch maximised so the dock layout has room for the
+    // Library / Viewer / Inspector / Timeline panels at any monitor
+    // size. The shell-supplied show_cmd is preserved as a fallback if
+    // the user explicitly requested a hidden / minimised launch.
+    if (show_cmd != SW_HIDE && show_cmd != SW_MINIMIZE
+        && show_cmd != SW_SHOWMINNOACTIVE
+        && show_cmd != SW_SHOWMINIMIZED) {
+        show_cmd = SW_SHOWMAXIMIZED;
+    }
     ::ShowWindow(hwnd_, show_cmd);
     ::UpdateWindow(hwnd_);
 }
@@ -160,10 +169,13 @@ std::wstring Window::pick_video_file(HWND owner) {
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrFilter =
+        L"Media files\0*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv;"
+                       L"*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif;*.tiff\0"
         L"Video files\0*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv\0"
+        L"Image files\0*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif;*.tiff\0"
         L"All files\0*.*\0\0";
     ofn.nFilterIndex = 1;
-    ofn.lpstrTitle   = L"Open video";
+    ofn.lpstrTitle   = L"Open media";
     ofn.Flags        = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (!::GetOpenFileNameW(&ofn)) return {};

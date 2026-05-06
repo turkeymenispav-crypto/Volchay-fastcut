@@ -53,13 +53,28 @@ public:
 
     int count() const noexcept { return count_; }
     const Entry& at(int i) const noexcept { return entries_[i]; }
-    double total_millis() const noexcept { return clock_.millis(); }
+    double total_millis() const noexcept {
+        return frozen_ ? frozen_millis_ : clock_.millis();
+    }
+
+    // Freeze the cold-start value once app initialisation is complete.
+    // Status displays then keep showing the constant launch time
+    // instead of a counter that drifts upward over the whole session.
+    void freeze() noexcept {
+        if (!frozen_) {
+            frozen_millis_ = clock_.millis();
+            frozen_        = true;
+        }
+    }
+    bool is_frozen() const noexcept { return frozen_; }
 
 private:
     static constexpr int kMax = 32;
     HiResClock clock_;
     Entry      entries_[kMax];
     int        count_ = 0;
+    bool       frozen_ = false;
+    double     frozen_millis_ = 0.0;
 };
 
 }  // namespace volchay

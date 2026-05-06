@@ -35,6 +35,10 @@ Makefile
 *.dylib
 *.ilk
 
+# Vendored prebuilt FFmpeg (BtbN MinGW shared) is committed; opt out of the
+# blanket *.dll / *.a / *.lib rules above for everything under it.
+!third_party/ffmpeg/**
+
 # Logs / dumps
 *.log
 *.dmp

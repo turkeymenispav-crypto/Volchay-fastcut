@@ -1,16 +1,21 @@
-// Media Foundation video reader. Decodes a single video stream into a
-// D3D11 dynamic texture that ImGui can sample.
+// Video reader. Decodes a single video stream into a D3D11 dynamic
+// texture that ImGui can sample.
 //
-// Threading model (V1):
-//   - All MF work — MFCreateSourceReaderFromURL, ReadSample,
-//     ConvertToContiguousBuffer, sample Lock — runs on a dedicated worker
-//     thread that owns the COM apartment. The decoded RGBA bytes are
-//     dropped into a system-memory back-buffer.
+// Originally implemented on Media Foundation (hence the name); now
+// backed by libavformat + libavcodec + libswscale. The class name is
+// kept stable so the call sites elsewhere in the editor don't have to
+// change.
+//
+// Threading model:
+//   - All libav work — avformat_open_input, av_read_frame,
+//     avcodec_send_packet/receive_frame, sws_scale — runs on a
+//     dedicated worker thread. The decoded BGRA bytes are dropped into
+//     a system-memory back-buffer.
 //   - The UI thread's pump() Map+memcpy+Unmap of the dynamic D3D11
 //     texture is the only thing it does for video. ID3D11DeviceContext
-//     map/unmap is cheap (a few ms on HD, 10-15 ms on 4K) and avoids the
-//     hundreds-of-milliseconds hitches we used to take on open() + first
-//     decode when everything ran on the UI thread.
+//     map/unmap is cheap and avoids the hundreds-of-milliseconds
+//     hitches we used to take on open() + first decode when everything
+//     ran on the UI thread.
 #pragma once
 
 #include "core/clip.h"
@@ -19,10 +24,17 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+struct AVFormatContext;
+struct AVCodecContext;
+struct AVPacket;
+struct AVFrame;
+struct SwsContext;
 
 namespace volchay::media {
 
@@ -34,15 +46,15 @@ public:
     MfPlayer(const MfPlayer&) = delete;
     MfPlayer& operator=(const MfPlayer&) = delete;
 
-    // One-time MFStartup; safe to call multiple times.
-    static bool ensure_started();
+    // No-op for the libav backend (kept for source-compatibility with
+    // the previous Media Foundation implementation).
+    static bool ensure_started() { return true; }
 
-    // Asynchronous-friendly open. The worker accepts the request and the
-    // UI thread does NOT block on decoder initialisation. Returns true if
-    // the worker was successfully signalled. is_open() flips to true once
-    // the source reader has been built and the metadata + texture are
-    // ready (a few tens of ms later for typical files); width()/height()/
-    // duration()/fps() flip from 0 at the same moment.
+    // Asynchronous-friendly open. The worker accepts the request and
+    // the UI thread does NOT block on decoder initialisation. Returns
+    // true if the worker successfully opened the file and probed
+    // metadata. Width/height/duration/fps are valid after this returns
+    // true.
     bool open(const std::wstring& path, ID3D11Device* device);
 
     // Tear down everything, joining the worker thread.
@@ -50,8 +62,8 @@ public:
 
     bool is_open() const { return reader_open_.load(); }
 
-    // Decoded frame metadata. All return 0 / false until the worker has
-    // finished probing the source — keep polling.
+    // Decoded frame metadata. All return 0 / false until the worker
+    // has finished probing the source.
     int    width()           const { return width_.load();    }
     int    height()          const { return height_.load();   }
     double fps()             const { return fps_.load();      }
@@ -64,29 +76,41 @@ public:
     bool hardware_decode() const { return hardware_decode_.load(); }
 
     // Stable across the lifetime of the open file (worker creates it
-    // before flipping is_open()=true). Returns nullptr until the texture
-    // exists.
+    // before flipping is_open()=true). Returns nullptr until the
+    // texture exists.
     ID3D11ShaderResourceView* current_srv() const { return srv_.get(); }
 
     // Asynchronous seek. The worker will decode a fresh frame at t and
     // make it available via pump() on the UI thread.
     void seek(core::TimeUs t);
 
-    // UI-thread side of the player. Uploads the latest decoded frame to
-    // the dynamic texture (if a fresh one is waiting) and asks the worker
-    // for another frame if the playhead has moved past the most recent
-    // one. Returns true when a new frame was uploaded this call.
+    // UI-thread side of the player. Uploads the latest decoded frame
+    // to the dynamic texture (if a fresh one is waiting) and asks the
+    // worker for another frame if the playhead has moved past the most
+    // recent one. Returns true when a new frame was uploaded this call.
     bool pump(core::TimeUs playhead_us);
 
-    void set_prefer_hardware(bool on) { prefer_hardware_.store(on); }
+    // Currently a no-op — libav's internal hwaccel selection happens
+    // automatically. Kept so call sites don't have to change.
+    void set_prefer_hardware(bool /*on*/) {}
+
+    // Preview quality. Sets the maximum height of the BGRA texture
+    // used for on-screen display. The decoder still runs at the
+    // source resolution; only the swscale stage and the GPU texture
+    // are smaller, which cuts upload bandwidth and helps the UI
+    // stay responsive on 4K HDR sources. Pass 0 to disable scaling
+    // (the texture matches source dimensions). Effective on the
+    // next open(); does NOT affect export.
+    void set_preview_max_height(int max_h) {
+        preview_max_h_.store(max_h < 0 ? 0 : max_h);
+    }
+    int preview_max_height() const { return preview_max_h_.load(); }
 
 private:
-    // ---- Worker thread (owns IMFSourceReader) ----
+    // ---- Worker thread (owns the libav decoder) ----
     void worker_main();
     bool worker_open(const std::wstring& path);
-    void worker_release_reader();
-    bool worker_create_reader(const std::wstring& path);
-    bool worker_configure_output_format();
+    void worker_release_decoder();
     bool worker_decode_one(core::TimeUs target_us);
 
     std::thread             worker_;
@@ -106,23 +130,20 @@ private:
 
     // Completion signal for open(): worker flips this true after
     // worker_open succeeds OR fails, so the UI thread can stop polling.
-    // Reset to false at the start of every open() call.
     std::atomic<bool>         open_done_{false};
 
-    // Reader-side state (worker only).
-    ComPtr<IMFSourceReader>           reader_;
-    ComPtr<IMFDXGIDeviceManager>      dxgi_manager_;
-    LONG                              stride_ = 0;
-    core::TimeUs                      pending_seek_ = -1;
-    core::TimeUs                      worker_pts_   = -1;
-    // True if the source reader output is NV12 and we have to convert it
-    // to BGRA on the worker thread (fallback for AV1 / decoder paths
-    // where MF refuses to give us RGB32 even with advanced processing).
-    bool                              convert_nv12_ = false;
+    // Decoder state (worker-only).
+    AVFormatContext*  fmt_ctx_     = nullptr;
+    AVCodecContext*   codec_ctx_   = nullptr;
+    SwsContext*       sws_ctx_     = nullptr;
+    AVPacket*         packet_      = nullptr;
+    AVFrame*          frame_       = nullptr;
+    int               video_stream_= -1;
+    int64_t           ts_offset_   = 0;   // av timebase rebased to 0
+    core::TimeUs      worker_pts_  = -1;
+    bool              first_frame_logged_ = false;  // log "First frame decoded" once per open, not per seek
 
-    // D3D11 (device + texture are thread-safe to create; ImmediateContext
-    // is UI-thread only). Texture and SRV are created on the worker after
-    // probing the source's frame size, then stay live until close().
+    // D3D11 (device + texture are thread-safe to create).
     ComPtr<ID3D11Device>              device_;
     ComPtr<ID3D11DeviceContext>       context_;     // UI thread only.
     ComPtr<ID3D11Texture2D>           texture_;
@@ -135,16 +156,17 @@ private:
     std::atomic<double>         fps_{0.0};
     std::atomic<core::TimeUs>   duration_{0};
     std::atomic<core::TimeUs>   current_pts_{-1};
-    std::atomic<bool>           prefer_hardware_{true};
     std::atomic<bool>           hardware_decode_{false};
+    // 0 = source-resolution preview; >0 = scale down so the texture
+    // height equals min(source_h, preview_max_h_). Read by the
+    // worker on open().
+    std::atomic<int>            preview_max_h_{0};
     std::wstring                source_path_;
 
     // Frame hand-off. Worker fills shared_buf_ with BGRA32 rows
-    // (rowstride = w*4), then sets frame_ready_=true. UI's pump() locks
-    // buf_mu_, maps the dynamic texture, memcpys the rows, unmaps. Single
-    // buffer is fine because the UI consumes every frame the worker
-    // produces (the worker only produces a new one after the previous
-    // was picked up — see decode_kick_).
+    // (rowstride = w*4), then sets frame_ready_=true. UI's pump()
+    // locks buf_mu_, maps the dynamic texture, memcpys the rows,
+    // unmaps.
     mutable std::mutex          buf_mu_;
     std::vector<unsigned char>  shared_buf_;
     int                         shared_buf_w_ = 0;

@@ -20,15 +20,35 @@ static void print_usage() {
 }
 
 int wmain(int argc, wchar_t** argv) {
-    if (argc < 2) {
-        print_usage();
-        return 1;
-    }
+    // Default to "register" when invoked with no arguments (e.g. by
+    // double-clicking volchay-register.exe in Explorer). Show a small
+    // MessageBox in that case so the user gets visual feedback that
+    // the registration succeeded.
+    bool no_args = (argc < 2);
     bool machine = false;
     for (int i = 2; i < argc; ++i) {
         if (::wcscmp(argv[i], L"--machine") == 0) machine = true;
     }
     bool per_user = !machine;
+
+    if (no_args) {
+        LONG e = volchay::shell::register_context_menu(per_user);
+        wchar_t msg[256];
+        if (e == ERROR_SUCCESS) {
+            ::lstrcpyW(msg,
+                L"Volchay-fastcut registered.\n\n"
+                L"Right-click any video file -> 'Open with Volchay-fastcut'.\n"
+                L"To remove: run 'volchay-register.exe unregister' from cmd.");
+            ::MessageBoxW(nullptr, msg, L"Volchay-fastcut",
+                          MB_ICONINFORMATION | MB_OK);
+            return 0;
+        } else {
+            ::wsprintfW(msg, L"Registration failed (error %ld).", long(e));
+            ::MessageBoxW(nullptr, msg, L"Volchay-fastcut",
+                          MB_ICONERROR | MB_OK);
+            return 2;
+        }
+    }
 
     if (::wcscmp(argv[1], L"register") == 0) {
         LONG e = volchay::shell::register_context_menu(per_user);

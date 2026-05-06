@@ -16,12 +16,16 @@ namespace volchay::media { class Exporter;    }
 
 namespace volchay::ui {
 
+class ThumbnailCache;
+
 // Aggregated state passed to every panel each frame.
 struct EditorContext {
     core::Project*           project   = nullptr;
-    media::MfPlayer*         player    = nullptr;
+    media::MfPlayer*         player    = nullptr;   // top track
+    media::MfPlayer*         player_bot = nullptr;  // layer below topmost
     media::AudioPlayer*      audio     = nullptr;
     media::Exporter*         exporter  = nullptr;
+    ThumbnailCache*          thumbs    = nullptr;
     StartupTrace*            startup   = nullptr;
     Settings*                settings  = nullptr;
 
@@ -30,10 +34,24 @@ struct EditorContext {
     bool* show_export     = nullptr;
     bool* show_diagnostics = nullptr;
 
+    // Viewer state (owned by MainLayout).
+    //   fullscreen          — hide all panels, viewer covers the work area.
+    //   preview_quality_idx — 0=Low(480), 1=Med(720), 2=Source.
+    //   aspect_idx          — 0=Source, 1=1:1, 2=4:3, 3=16:9, 4=9:16, 5=21:9.
+    bool* fullscreen          = nullptr;
+    int*  preview_quality_idx = nullptr;
+    int*  aspect_idx          = nullptr;
+
     // Callback invoked when the user requests opening a file via the
     // menu / drag&drop. Implemented by App.
     std::function<void(const std::wstring& path)> open_file;
     std::function<void()> exit_app;
+
+    // Triggered from File > Extract audio. Implemented by App: writes
+    // the active source's audio track to <basename>.m4a next to the
+    // source. No GUI of its own; results are surfaced via a status
+    // toast / message box.
+    std::function<void()> extract_audio;
 
     // Wall-clock since app launched, for status bar.
     double session_seconds = 0.0;
@@ -68,6 +86,11 @@ private:
     bool show_about_        = false;
     bool show_startup_log_  = false;
     mutable bool settings_atlas_dirty_ = false;
+
+    // Viewer state.
+    bool fullscreen_          = false;
+    int  preview_quality_idx_ = 2;   // 0=Low(480) 1=Med(720) 2=Source
+    int  aspect_idx_          = 0;   // 0=Source 1=1:1 2=4:3 3=16:9 4=9:16 5=21:9
 };
 
 }  // namespace volchay::ui

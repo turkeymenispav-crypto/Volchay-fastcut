@@ -25,7 +25,23 @@ std::wstring resolve_exe_path(const wchar_t* override_path) {
     wchar_t buf[MAX_PATH] = L"";
     DWORD n = ::GetModuleFileNameW(nullptr, buf, MAX_PATH);
     if (n == 0 || n == MAX_PATH) return {};
-    return std::wstring(buf, n);
+    std::wstring self(buf, n);
+
+    // Prefer "volchay-fastcut.exe" in the same directory if we can find
+    // it. The registrar utility itself is a console app and must NOT be
+    // pointed to from the context menu; otherwise clicking the entry
+    // just flashes a console window and exits.
+    size_t slash = self.find_last_of(L"\\/");
+    std::wstring dir = (slash == std::wstring::npos)
+                       ? std::wstring{}
+                       : self.substr(0, slash + 1);
+    std::wstring candidate = dir + L"volchay-fastcut.exe";
+    DWORD attrs = ::GetFileAttributesW(candidate.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES
+        && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        return candidate;
+    }
+    return self;
 }
 
 LONG set_str(HKEY base, const std::wstring& sub,
@@ -111,6 +127,11 @@ LONG unregister_extension(HKEY base, const wchar_t* ext) {
     delete_tree(base,
         std::wstring(L"Software\\Classes\\SystemFileAssociations\\")
         + ext + L"\\shell\\" + kVerbName);
+    // Also remove any older registration that lived directly under the
+    // extension's own \shell tree (some earlier builds wrote there).
+    delete_tree(base,
+        std::wstring(L"Software\\Classes\\")
+        + ext + L"\\shell\\" + kVerbName);
     return ERROR_SUCCESS;
 }
 
@@ -136,11 +157,18 @@ LONG register_context_menu(bool per_user, const wchar_t* exe_path) {
 }
 
 LONG unregister_context_menu(bool per_user) {
-    HKEY base = per_user ? HKEY_CURRENT_USER : HKEY_LOCAL_MACHINE;
-    for (int i = 0; i < kRegisteredExtensionCount; ++i) {
-        unregister_extension(base, kRegisteredExtensions[i]);
+    // Unregister from BOTH scopes. The flag is preserved for API compat,
+    // but a partial cleanup leaves dangling entries in the other scope
+    // (e.g. when the user registered with --machine but unregisters
+    // without it). Since we only ever touch keys we own, this is safe.
+    (void)per_user;
+    HKEY scopes[] = { HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE };
+    for (HKEY base : scopes) {
+        for (int i = 0; i < kRegisteredExtensionCount; ++i) {
+            unregister_extension(base, kRegisteredExtensions[i]);
+        }
+        delete_tree(base, std::wstring(L"Software\\Classes\\") + kProgId);
     }
-    delete_tree(base, std::wstring(L"Software\\Classes\\") + kProgId);
     ::SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return ERROR_SUCCESS;
 }

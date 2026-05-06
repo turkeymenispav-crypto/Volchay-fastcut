@@ -44,6 +44,7 @@ jobs:
           mkdir -p dist
           cp build/volchay-fastcut.exe       dist/
           cp build/volchay-register.exe      dist/
+          cp third_party/ffmpeg/bin/*.dll    dist/
           cp installer/register-context-menu.bat   dist/
           cp installer/unregister-context-menu.bat dist/
           cp README.md BUILD_WINDOWS.md LICENSE    dist/
@@ -60,6 +61,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The vendored FFmpeg in third_party/ffmpeg/ ships MinGW-style
+      # import libraries (*.dll.a) only. MSVC needs proper *.lib files
+      # for linking. Generate them from the bundled .dll runtimes by
+      # extracting their export tables with `dumpbin /exports` and
+      # producing matching .def files that `lib /def:` can turn into
+      # .lib import libraries.
+      - name: Make MSVC import libs from FFmpeg DLLs
+        shell: pwsh
+        run: |
+          $vsdir = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          Import-Module "$vsdir\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath "$vsdir" -SkipAutomaticLocation -DevCmdArguments "-arch=x64 -no_logo"
+
+          $ff = "third_party/ffmpeg"
+          New-Item -Force -ItemType Directory -Path "$ff/lib" | Out-Null
+          Get-ChildItem "$ff/bin" -Filter *.dll | ForEach-Object {
+              $dll  = $_.FullName
+              $base = $_.BaseName            # e.g. avformat-62
+              $stem = ($base -replace '-\d+$','')   # e.g. avformat
+              Write-Host "Generating .lib for $base ($stem)"
+              $exports = & dumpbin /EXPORTS $dll | Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+(\S+)' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+              $def = "$ff/lib/$stem.def"
+              "EXPORTS"        | Set-Content -Encoding ascii $def
+              $exports         | Add-Content -Encoding ascii $def
+              & lib /nologo /machine:x64 /def:"$def" /name:"$($_.Name)" /out:"$ff/lib/$stem.lib"
+          }
+          Get-ChildItem "$ff/lib"
+
       - name: Configure
         shell: pwsh
         run: cmake -S . -B build -A x64
@@ -74,6 +103,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item build/Release/volchay-fastcut.exe       dist/
           Copy-Item build/Release/volchay-register.exe      dist/
+          Copy-Item third_party/ffmpeg/bin/*.dll            dist/
           Copy-Item installer/register-context-menu.bat     dist/
           Copy-Item installer/unregister-context-menu.bat   dist/
           Copy-Item README.md, BUILD_WINDOWS.md, LICENSE    dist/

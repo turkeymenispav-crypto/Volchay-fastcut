@@ -2,7 +2,7 @@
 
 // 101 = main window icon. Windows uses its default if the file is missing.
 // Drop a .ico into assets/ and uncomment the next line to bundle it.
-// 101 ICON "../../assets/app.ico"
+101 ICON "../../assets/app.ico"
 
 // Application manifest (DPI awareness, OS compatibility).
 1 24 "app.manifest"

@@ -75,6 +75,31 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
+# FFmpeg / libav (vendored prebuilt, BtbN MinGW build).
+# Headers under third_party/ffmpeg/include, MinGW import libs in
+# third_party/ffmpeg/lib, and the .dll runtime in third_party/ffmpeg/bin
+# (copied next to volchay-fastcut.exe at build time).
+# ---------------------------------------------------------------------------
+set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ffmpeg")
+add_library(ffmpeg INTERFACE)
+target_include_directories(ffmpeg INTERFACE "${FFMPEG_DIR}/include")
+target_link_libraries(ffmpeg INTERFACE
+    "${FFMPEG_DIR}/lib/libavformat.dll.a"
+    "${FFMPEG_DIR}/lib/libavcodec.dll.a"
+    "${FFMPEG_DIR}/lib/libavutil.dll.a"
+    "${FFMPEG_DIR}/lib/libswscale.dll.a"
+    "${FFMPEG_DIR}/lib/libswresample.dll.a"
+)
+
+set(FFMPEG_RUNTIME_DLLS
+    "${FFMPEG_DIR}/bin/avformat-62.dll"
+    "${FFMPEG_DIR}/bin/avcodec-62.dll"
+    "${FFMPEG_DIR}/bin/avutil-60.dll"
+    "${FFMPEG_DIR}/bin/swscale-9.dll"
+    "${FFMPEG_DIR}/bin/swresample-6.dll"
+)
+
+# ---------------------------------------------------------------------------
 # Dear ImGui (docking branch, vendored).
 # ---------------------------------------------------------------------------
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
@@ -114,6 +139,7 @@ set(VOLCHAY_SOURCES
     src/core/project.cpp
 
     src/ui/theme.cpp
+    src/ui/widgets.cpp
     src/ui/fonts.cpp
     src/ui/main_layout.cpp
     src/ui/panels/viewer.cpp
@@ -122,6 +148,8 @@ set(VOLCHAY_SOURCES
     src/ui/panels/inspector.cpp
     src/ui/panels/settings.cpp
     src/ui/panels/export_panel.cpp
+    src/ui/panels/transitions.cpp
+    src/ui/thumbnail_cache.cpp
 
     src/util/log.cpp
     src/util/settings.cpp
@@ -140,6 +168,7 @@ target_include_directories(volchay-fastcut PRIVATE src)
 
 target_link_libraries(volchay-fastcut PRIVATE
     imgui
+    ffmpeg
     # Core Win32
     user32 gdi32 ole32 oleaut32 uuid shell32 shlwapi advapi32 comctl32 comdlg32
     # Direct3D / DXGI
@@ -150,12 +179,21 @@ target_link_libraries(volchay-fastcut PRIVATE
     dcomp
     # DWM (used by Dear ImGui Win32 backend for alpha compositing)
     dwmapi
-    # Media Foundation
+    # Media Foundation (still used by the H.264/AAC exporter)
     mfplat mfreadwrite mfuuid mf
     # WASAPI / MMDevice for audio playback
     winmm
     # Windows Imaging
     windowscodecs
+)
+
+# Copy the ffmpeg runtime DLLs next to the executable so they're
+# resolved from the same directory at startup.
+add_custom_command(TARGET volchay-fastcut POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${FFMPEG_RUNTIME_DLLS}
+            "$<TARGET_FILE_DIR:volchay-fastcut>"
+    COMMAND_EXPAND_LISTS
 )
 
 # Use the Unicode entry point (wWinMain) on MinGW, which requires -municode.
@@ -196,6 +234,8 @@ endif()
 # ---------------------------------------------------------------------------
 install(TARGETS volchay-fastcut volchay-register
         RUNTIME DESTINATION bin)
+install(FILES ${FFMPEG_RUNTIME_DLLS}
+        DESTINATION bin)
 install(FILES installer/register-context-menu.bat
               installer/unregister-context-menu.bat
         DESTINATION bin)
