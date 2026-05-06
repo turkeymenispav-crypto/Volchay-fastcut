@@ -6,6 +6,7 @@
 #include "ui/panels/library.h"
 #include "ui/panels/settings.h"
 #include "ui/panels/timeline.h"
+#include "ui/panels/transitions.h"
 #include "ui/panels/viewer.h"
 #include "ui/theme.h"
 #include "ui/widgets.h"
@@ -45,10 +46,11 @@ void MainLayout::install_dock_layout(unsigned dockspace_id) {
     ImGuiID dock_right = ImGui::DockBuilderSplitNode(
         dock_main, ImGuiDir_Right, 0.22f, nullptr, &dock_main);
 
-    ImGui::DockBuilderDockWindow("Library",   dock_left);
-    ImGui::DockBuilderDockWindow("Viewer",    dock_main);
-    ImGui::DockBuilderDockWindow("Inspector", dock_right);
-    ImGui::DockBuilderDockWindow("Timeline",  dock_bottom);
+    ImGui::DockBuilderDockWindow("Library",     dock_left);
+    ImGui::DockBuilderDockWindow("Transitions", dock_left);   // tabbed with Library
+    ImGui::DockBuilderDockWindow("Viewer",      dock_main);
+    ImGui::DockBuilderDockWindow("Inspector",   dock_right);
+    ImGui::DockBuilderDockWindow("Timeline",    dock_bottom);
 
     ImGui::DockBuilderFinish(dockspace_id);
 }
@@ -253,10 +255,11 @@ void MainLayout::render(EditorContext& ctx) {
                      ImGuiDockNodeFlags_PassthruCentralNode);
     ImGui::End();
 
-    panels::draw_library  (ctx);
-    panels::draw_viewer   (ctx);
-    panels::draw_timeline (ctx);
-    panels::draw_inspector(ctx);
+    panels::draw_library    (ctx);
+    panels::draw_transitions(ctx);
+    panels::draw_viewer     (ctx);
+    panels::draw_timeline   (ctx);
+    panels::draw_inspector  (ctx);
 
     if (panels::draw_settings(ctx)) settings_atlas_dirty_ = true;
     panels::draw_export(ctx);

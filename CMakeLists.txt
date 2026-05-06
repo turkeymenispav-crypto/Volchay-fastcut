@@ -148,6 +148,8 @@ set(VOLCHAY_SOURCES
     src/ui/panels/inspector.cpp
     src/ui/panels/settings.cpp
     src/ui/panels/export_panel.cpp
+    src/ui/panels/transitions.cpp
+    src/ui/thumbnail_cache.cpp
 
     src/util/log.cpp
     src/util/settings.cpp

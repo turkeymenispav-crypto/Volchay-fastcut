@@ -169,10 +169,13 @@ std::wstring Window::pick_video_file(HWND owner) {
     ofn.lpstrFile   = buf;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrFilter =
+        L"Media files\0*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv;"
+                       L"*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif;*.tiff\0"
         L"Video files\0*.mp4;*.mov;*.mkv;*.webm;*.avi;*.m4v;*.wmv\0"
+        L"Image files\0*.png;*.jpg;*.jpeg;*.bmp;*.webp;*.gif;*.tiff\0"
         L"All files\0*.*\0\0";
     ofn.nFilterIndex = 1;
-    ofn.lpstrTitle   = L"Open video";
+    ofn.lpstrTitle   = L"Open media";
     ofn.Flags        = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (!::GetOpenFileNameW(&ofn)) return {};

@@ -1,5 +1,7 @@
 #include "ui/panels/viewer.h"
 
+#include "core/clip.h"
+#include "core/project.h"
 #include "media/audio_player.h"
 #include "ui/main_layout.h"
 #include "ui/theme.h"
@@ -272,6 +274,78 @@ void draw_viewer(EditorContext& ctx) {
         ImGui::Image(tex, fit.size, uv0, uv1);
         ImGui::SetCursorScreenPos(cur);
         ImGui::Dummy(avail);
+
+        // Transition overlays. We draw them on top of the picture so
+        // they're visible at preview time even before a real GPU
+        // composite path exists. FadeIn / FadeOut / DipToBlack render
+        // as a black rectangle with time-varying alpha. CrossFade and
+        // Wipe render as a hint that fades; full second-stream blend
+        // is wired in the exporter only.
+        if (ctx.project) {
+            const auto& clips       = ctx.project->clips();
+            const auto& transitions = ctx.project->transitions();
+            const core::TimeUs ph   = ctx.project->playhead();
+            for (const auto& tr : transitions) {
+                if (tr.kind == core::TransitionKind::None ||
+                    tr.kind == core::TransitionKind::Cut) continue;
+                if (tr.after_clip < 0 ||
+                    tr.after_clip >= (int)clips.size() - 1) continue;
+                const auto& left  = clips[tr.after_clip];
+                const auto& right = clips[tr.after_clip + 1];
+                const core::TimeUs half  = tr.duration / 2;
+                const core::TimeUs seam  = std::max(left.t_out(), right.t_in);
+                const core::TimeUs start = seam - half;
+                const core::TimeUs end   = seam + half;
+                if (ph < start || ph >= end) continue;
+                const double u = double(ph - start) / double(tr.duration);
+                float alpha = 0.0f;
+                switch (tr.kind) {
+                    case core::TransitionKind::FadeIn:
+                        alpha = float(1.0 - u);          // black -> picture
+                        break;
+                    case core::TransitionKind::FadeOut:
+                        alpha = float(u);                // picture -> black
+                        break;
+                    case core::TransitionKind::DipToBlack: {
+                        // 0..0.5 fade out, 0.5..1 fade in.
+                        alpha = u < 0.5
+                                ? float(u * 2.0)
+                                : float((1.0 - u) * 2.0);
+                    } break;
+                    case core::TransitionKind::CrossFade: {
+                        // Approximation: dim the current picture in the
+                        // middle of the transition. Real two-stream
+                        // blend is exporter-side.
+                        alpha = float(0.5 *
+                                      (1.0 - std::cos(u * 3.14159265)));
+                        alpha = alpha * 0.6f;             // never fully black
+                    } break;
+                    case core::TransitionKind::Wipe: {
+                        // Draw a moving vertical band sweeping L->R.
+                        const float xw =
+                            fit.pos.x + fit.size.x * float(u);
+                        dl->AddRectFilled(
+                            ImVec2(fit.pos.x, fit.pos.y),
+                            ImVec2(xw, fit.pos.y + fit.size.y),
+                            IM_COL32(0, 0, 0, 90));
+                        dl->AddLine(
+                            ImVec2(xw, fit.pos.y),
+                            ImVec2(xw, fit.pos.y + fit.size.y),
+                            IM_COL32(217, 119, 87, 255), 2.f);
+                        continue;
+                    } break;
+                    default: break;
+                }
+                if (alpha > 0.0f) {
+                    const ImU32 col = IM_COL32(0, 0, 0, int(alpha * 255.f));
+                    dl->AddRectFilled(
+                        fit.pos,
+                        ImVec2(fit.pos.x + fit.size.x,
+                               fit.pos.y + fit.size.y),
+                        col);
+                }
+            }
+        }
     } else {
         ImGui::SetCursorScreenPos(cur);
         ImGui::Dummy(avail);

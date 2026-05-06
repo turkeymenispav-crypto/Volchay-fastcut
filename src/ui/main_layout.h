@@ -16,12 +16,15 @@ namespace volchay::media { class Exporter;    }
 
 namespace volchay::ui {
 
+class ThumbnailCache;
+
 // Aggregated state passed to every panel each frame.
 struct EditorContext {
     core::Project*           project   = nullptr;
     media::MfPlayer*         player    = nullptr;
     media::AudioPlayer*      audio     = nullptr;
     media::Exporter*         exporter  = nullptr;
+    ThumbnailCache*          thumbs    = nullptr;
     StartupTrace*            startup   = nullptr;
     Settings*                settings  = nullptr;
 

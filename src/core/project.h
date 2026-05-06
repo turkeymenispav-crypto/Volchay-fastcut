@@ -25,14 +25,23 @@ public:
     void update_media_probe(std::string_view id,
                             TimeUs duration, int w, int h, double fps);
 
-    // Append a clip referencing media_id. If the clip does not yet have a
-    // timeline position, it is placed at the current playhead.
+    // Append a clip referencing media_id on track 0 (main track), placed
+    // flush against the existing timeline tail of that track.
     Clip& append_clip(const std::string& media_id);
+
+    // Append a clip on a specific track. The new clip is positioned at
+    // the current playhead (CapCut-style — when you drop a second media
+    // onto V2 above an existing V1 clip, the overlay starts under the
+    // playhead). If track is unused so far, it is allocated.
+    Clip& append_clip_on_track(const std::string& media_id, int track);
 
     // Replace the (sole) clip on the timeline with a single clip spanning
     // the entire media, positioned at 0. Used when opening a video from
     // the context menu / drag&drop.
     Clip& set_single_clip(const std::string& media_id);
+
+    // Total number of currently-occupied video tracks (max(track)+1).
+    int video_track_count() const;
 
     // Remove all clips.
     void clear_clips();
@@ -40,6 +49,14 @@ public:
     const std::vector<Media>& media() const { return media_; }
     const std::vector<Clip>&  clips() const { return clips_; }
     std::vector<Clip>&        clips_mut()   { return clips_; }
+
+    // Transitions placed between clip boundaries.
+    const std::vector<Transition>& transitions() const { return transitions_; }
+    std::vector<Transition>&       transitions_mut()   { return transitions_; }
+    void add_or_update_transition(int after_clip,
+                                  TransitionKind kind,
+                                  TimeUs duration);
+    void remove_transition_at(int after_clip);
 
     // Timeline duration: end of last clip.
     TimeUs duration() const;
@@ -84,6 +101,14 @@ public:
     bool trim_in (const std::string& clip_id, TimeUs new_t_in);
     bool trim_out(const std::string& clip_id, TimeUs new_t_out);
 
+    // "Razor" trims. trim_left_at(t)  removes everything before t — clips
+    // entirely before t are deleted, the clip under t is split and its
+    // left half discarded, then a ripple shift snaps the remainder to 0.
+    // trim_right_at(t) removes everything after t (no ripple needed).
+    // Returns the number of clips removed (or trimmed).
+    int trim_left_at (TimeUs t);
+    int trim_right_at(TimeUs t);
+
     // -----------------------------------------------------------------
     // Undo/Redo. We snapshot the full editing state (clips + playhead)
     // before each mutating operation; the stack is bounded to keep memory
@@ -101,11 +126,12 @@ private:
         TimeUs            playhead;
     };
 
-    std::vector<Media> media_;
-    std::vector<Clip>  clips_;
-    TimeUs             playhead_ = 0;
-    bool               playing_  = false;
-    bool               dirty_    = false;
+    std::vector<Media>      media_;
+    std::vector<Clip>       clips_;
+    std::vector<Transition> transitions_;
+    TimeUs                  playhead_ = 0;
+    bool                    playing_  = false;
+    bool                    dirty_    = false;
 
     int next_clip_seq_ = 1;
 

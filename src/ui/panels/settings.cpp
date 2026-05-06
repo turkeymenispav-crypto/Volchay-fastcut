@@ -74,9 +74,10 @@ bool draw_settings(EditorContext& ctx) {
 
         if (ImGui::CollapsingHeader("Playback",
                                     ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::SliderFloat("Volume", &s.audio_volume, 0.0f, 1.0f, "%.2f");
-            ImGui::Checkbox("Mute",          &s.audio_mute);
-            ImGui::Checkbox("Loop playback", &s.loop_playback);
+            ImGui::SliderFloat("Volume##settings_vol", &s.audio_volume,
+                               0.0f, 1.0f, "%.2f");
+            ImGui::Checkbox("Mute##settings_mute",          &s.audio_mute);
+            ImGui::Checkbox("Loop playback##settings_loop", &s.loop_playback);
         }
 
         if (ImGui::CollapsingHeader("Performance / low-end mode",

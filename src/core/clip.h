@@ -39,9 +39,17 @@ struct Media {
 //                  becomes
 //   timeline:  ...|---- clip ----|...
 //                ^t_in           ^t_out  (t_out = t_in + (src_out - src_in)/speed)
+//
+// The track index is layered: V0 / V1 / V2 / ... — higher indices are
+// composited over lower ones (CapCut convention). Negative values mean
+// "audio-only" tracks (A0, A1, ...) and use abs(idx) - 1 as the audio
+// track index. Most clips with video implicitly carry their audio on
+// the same track (two-clip-per-source isn't needed at this stage).
 struct Clip {
     std::string id;            // stable id
     std::string media_id;      // -> Media.id
+
+    int     track    = 0;      // 0 = main video; higher = overlay tracks
 
     TimeUs  src_in   = 0;      // start offset inside source
     TimeUs  src_out  = 0;      // end offset inside source
@@ -52,6 +60,7 @@ struct Clip {
     float   volume   = 1.0f;   // linear gain, 1.0 = unchanged
     bool    muted    = false;
     bool    selected = false;  // UI selection state (transient, not saved)
+    float   opacity  = 1.0f;   // 0..1, only meaningful on overlay tracks
 
     TimeUs duration_on_timeline() const {
         TimeUs src_dur = src_out - src_in;
@@ -60,6 +69,31 @@ struct Clip {
         return TimeUs(double(src_dur) / speed);
     }
     TimeUs t_out() const { return t_in + duration_on_timeline(); }
+};
+
+// Transitions live "on a clip boundary" — i.e. between clip[i] and
+// clip[i+1] in timeline order. The model is intentionally minimal for
+// V2: kind + duration. Real GPU rendering during playback / export is
+// a follow-up; for now the timeline panel draws a bevel at the
+// boundary so the editor can author them.
+enum class TransitionKind {
+    None     = 0,
+    Cut      = 1,   // hard cut (no actual blend) — explicit "no transition"
+    FadeIn   = 2,   // fade from black at the head of the next clip
+    FadeOut  = 3,   // fade to   black at the tail of the previous clip
+    CrossFade = 4,  // dissolve between two clips
+    DipToBlack = 5, // fade out then in
+    Wipe     = 6,   // simple horizontal wipe
+};
+
+struct Transition {
+    // After-clip index: this transition sits at the boundary between
+    // clips()[after_clip] and clips()[after_clip+1]. -1 = no anchor yet
+    // (template entry from the Transitions panel before the user drops
+    // it onto a boundary).
+    int             after_clip = -1;
+    TransitionKind  kind       = TransitionKind::CrossFade;
+    TimeUs          duration   = 500'000;   // 0.5s default
 };
 
 }  // namespace volchay::core

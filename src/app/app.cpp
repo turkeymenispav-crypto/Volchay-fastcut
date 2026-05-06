@@ -9,6 +9,7 @@
 #include <imgui_impl_win32.h>
 
 #include <algorithm>
+#include <cwctype>
 
 namespace volchay::app {
 
@@ -86,6 +87,8 @@ bool App::initialize(int show_cmd, StartupTrace& trace) {
     if (!d3d_.initialize(window_.hwnd())) return false;
     trace.mark("d3d ready");
 
+    thumbs_.set_device(d3d_.device());
+
     if (!initialise_imgui()) return false;
     trace.mark("imgui ready");
 
@@ -96,6 +99,25 @@ void App::open_initial_video(const std::wstring& path) {
     if (!path.empty()) open_video(path);
 }
 
+namespace {
+
+// Heuristic: still-image extensions (lower-cased). FFmpeg can decode
+// these via image2 demuxer just fine, but they have ~0 duration so we
+// give the resulting clip a reasonable default time on the timeline.
+bool is_still_image_path(const std::wstring& path) {
+    auto ext_pos = path.find_last_of(L'.');
+    if (ext_pos == std::wstring::npos) return false;
+    std::wstring ext = path.substr(ext_pos);
+    for (auto& c : ext) c = wchar_t(::towlower(c));
+    return ext == L".png" || ext == L".jpg"  || ext == L".jpeg"
+        || ext == L".bmp" || ext == L".webp" || ext == L".gif"
+        || ext == L".tiff" || ext == L".tif";
+}
+
+constexpr core::TimeUs kDefaultStillDuration = 5'000'000;  // 5 s
+
+}  // namespace
+
 void App::open_video(const std::wstring& path) {
     if (path.empty()) {
         std::wstring picked = Window::pick_video_file(window_.hwnd());
@@ -104,71 +126,104 @@ void App::open_video(const std::wstring& path) {
     }
 
     log::info("open_video: %s", volchay::narrow(path).c_str());
-    player_.set_prefer_hardware(settings_.hardware_decode);
-    if (!player_.open(path, d3d_.device())) {
-        log::err("Failed to open video file");
-        return;
+
+    const bool is_image = is_still_image_path(path);
+
+    if (!is_image) {
+        // Video file path — open through the AV decoder + WASAPI audio.
+        player_.set_prefer_hardware(settings_.hardware_decode);
+        if (!player_.open(path, d3d_.device())) {
+            log::err("Failed to open video file");
+            return;
+        }
+        audio_.open(path);
+        audio_.set_volume(settings_.audio_volume);
+        audio_.set_muted(settings_.audio_mute);
+        current_media_path_ = path;
     }
-    audio_.open(path);
-    audio_.set_volume(settings_.audio_volume);
-    audio_.set_muted(settings_.audio_mute);
 
     auto& m = project_.add_media(path);
-    project_.update_media_probe(m.id,
-        player_.duration(), player_.width(), player_.height(), player_.fps());
-    project_.set_single_clip(m.id);
-    project_.set_playing(true);
-    was_playing_ = true;
-    audio_.play();
+    if (is_image) {
+        // Use the default still duration; libav reports 0 for stills,
+        // which would produce a zero-length clip on the timeline.
+        project_.update_media_probe(m.id, kDefaultStillDuration,
+                                    /*w*/ 0, /*h*/ 0, /*fps*/ 0.0);
+    } else {
+        project_.update_media_probe(m.id,
+            player_.duration(), player_.width(), player_.height(),
+            player_.fps());
+    }
+
+    // Append behaviour: on the very first import, place the clip at 0
+    // and start playback. On subsequent imports, drop the clip onto
+    // the end of the existing timeline so the user is "adding" to the
+    // project, not replacing it.
+    const bool first_clip = project_.clips().empty();
+    if (first_clip) {
+        project_.set_single_clip(m.id);
+        if (!is_image) {
+            project_.set_playing(true);
+            was_playing_ = true;
+            audio_.play();
+        }
+    } else {
+        // Place at the current timeline tail.
+        project_.append_clip(m.id);
+        // Don't restart playback; user keeps editing where they were.
+    }
 }
 
 void App::advance_playhead(double dt_seconds) {
     if (!project_.is_playing()) return;
     if (project_.duration() <= 0) return;
 
-    // The audio engine's clock is FILE PTS (offset inside the source
-    // media), but project_.playhead() is TIMELINE PTS (offset on the
-    // edit timeline, after trim / split / multi-clip layout). Translate
-    // file -> timeline through the active clip so trimming a clip
-    // doesn't desync audio from the visual playhead.
-    core::TimeUs ph;
+    // Multi-clip timeline. The audio engine is only ever loaded with the
+    // source file of one clip at a time, so it can't be the master clock
+    // across boundaries. We instead drive the playhead from wall-clock
+    // dt (which is what every NLE actually does — the audio worker keeps
+    // its own internal clock for sample alignment, but the timeline
+    // playhead is driven by render time).
+    //
+    // Within a single clip, however, we still snap to audio PTS to keep
+    // A/V in lock-step: any drift between dt-accumulation and the
+    // audio worker's actual playback would surface as desync over a
+    // long clip. So we use wall-clock dt for "free time" and a small
+    // drift correction toward audio PTS when the audio engine has the
+    // currently-active clip's media loaded.
+    core::TimeUs ph = project_.playhead();
+    ph += core::TimeUs(dt_seconds * 1'000'000.0);
+
     if (audio_.has_audio() && audio_.current_pts_us() >= 0) {
-        const core::TimeUs file_pts = audio_.current_pts_us();
-        const auto& clips = project_.clips();
         const core::Clip* active = nullptr;
-        for (const auto& c : clips) {
-            if (file_pts >= c.src_in && file_pts < c.src_out) {
-                active = &c;
-                break;
+        (void)project_.source_time_at(ph, &active);
+        const core::Media* active_m =
+            active ? project_.find_media(active->media_id) : nullptr;
+        if (active_m && active_m->path == current_media_path_) {
+            // We're playing inside a clip whose media matches the audio
+            // engine's currently-loaded file — apply a soft drift
+            // correction toward the audio master clock.
+            const core::TimeUs file_pts = audio_.current_pts_us();
+            if (file_pts >= active->src_in && file_pts < active->src_out) {
+                const double dur_src = double(file_pts - active->src_in);
+                const double dur_tl  = (active->speed > 0.0)
+                                     ? dur_src / active->speed
+                                     : dur_src;
+                const core::TimeUs ph_audio =
+                    active->t_in + core::TimeUs(dur_tl);
+                // Snap on big jumps (>50ms drift), low-pass-filter on small.
+                core::TimeUs delta = ph_audio - ph;
+                if (delta < -50'000 || delta > 50'000) {
+                    ph = ph_audio;
+                } else {
+                    ph += delta / 4;   // 25 % gain LPF
+                }
             }
         }
-        if (active) {
-            const double dur_src = double(file_pts - active->src_in);
-            const double dur_tl  = (active->speed > 0.0)
-                                 ? dur_src / active->speed
-                                 : dur_src;
-            ph = active->t_in + core::TimeUs(dur_tl);
-        } else if (!clips.empty()) {
-            // Audio is past the trimmed-out tail (or before src_in).
-            // Treat as "reached end" for the active clip.
-            const auto& c = clips.front();
-            ph = (file_pts < c.src_in) ? c.t_in : c.t_out();
-        } else {
-            ph = file_pts;
-        }
-    } else {
-        ph = project_.playhead();
-        ph += core::TimeUs(dt_seconds * 1'000'000.0);
     }
+
     if (ph >= project_.duration()) {
         if (settings_.loop_playback) {
             ph = 0;
-            // Seek audio to the FILE PTS at timeline 0, which is the
-            // first clip's src_in (not necessarily 0 in the file).
-            core::TimeUs file_t = project_.source_time_at(0);
-            if (file_t < 0) file_t = 0;
-            audio_.seek(file_t);
-            player_.seek(file_t);
         } else {
             ph = project_.duration();
             project_.set_playing(false);
@@ -176,6 +231,47 @@ void App::advance_playhead(double dt_seconds) {
         }
     }
     project_.set_playhead(ph);
+}
+
+void App::sync_media_to_playhead() {
+    if (project_.clips().empty()) return;
+
+    const core::Clip* active = nullptr;
+    (void)project_.source_time_at(project_.playhead(), &active);
+    if (!active) return;
+
+    const core::Media* m = project_.find_media(active->media_id);
+    if (!m) return;
+
+    if (m->path == current_media_path_) return;
+    const std::wstring wanted = m->path;
+
+    // Crossed a clip boundary into a clip whose source media is not
+    // loaded in the AV decoder + audio engine yet. Re-open both, then
+    // seek inside the new file to the FILE PTS that corresponds to the
+    // current playhead position inside the new clip.
+    log::info("sync_media_to_playhead: switching to %s",
+              volchay::narrow(wanted).c_str());
+
+    player_.set_prefer_hardware(settings_.hardware_decode);
+    if (player_.open(wanted, d3d_.device())) {
+        current_media_path_ = wanted;
+    } else {
+        log::err("sync_media_to_playhead: failed to open %s",
+                 volchay::narrow(wanted).c_str());
+        return;
+    }
+
+    audio_.open(wanted);
+    audio_.set_volume(settings_.audio_volume);
+    audio_.set_muted(settings_.audio_mute);
+
+    const core::TimeUs file_t = project_.source_time_at(project_.playhead());
+    if (file_t >= 0) {
+        player_.seek(file_t);
+        audio_.seek(file_t);
+    }
+    if (project_.is_playing()) audio_.play();
 }
 
 void App::render_one_frame() {
@@ -200,6 +296,12 @@ void App::render_one_frame() {
 
     advance_playhead(dt);
 
+    // Multi-clip playback: if the playhead crossed a clip boundary
+    // into a clip whose source media is not currently loaded in the
+    // player + audio engine, swap them now (and seek to the right
+    // FILE PTS inside the new file).
+    sync_media_to_playhead();
+
     if (player_.is_open()) {
         // pump() wants FILE PTS, not timeline PTS — translate through
         // the active clip so trimmed/split layouts request the right
@@ -210,9 +312,25 @@ void App::render_one_frame() {
         player_.pump(file_t);
     }
 
-    // Apply audio settings every frame (cheap atomics).
-    audio_.set_volume(settings_.audio_volume);
-    audio_.set_muted(settings_.audio_mute);
+    // Apply audio settings every frame (cheap atomics). The effective
+    // volume/mute is the *combined* state of the global Settings panel
+    // sliders AND the per-clip controls in the Inspector for the clip
+    // currently under the playhead, so both UIs visibly affect playback.
+    {
+        float       gain = settings_.audio_volume;
+        bool        mute = settings_.audio_mute;
+        const auto& cs   = project_.clips();
+        const core::TimeUs ph = project_.playhead();
+        for (const auto& c : cs) {
+            if (ph >= c.t_in && ph < c.t_out()) {
+                gain *= c.volume;
+                if (c.muted) mute = true;
+                break;
+            }
+        }
+        audio_.set_volume(gain);
+        audio_.set_muted(mute);
+    }
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -223,6 +341,7 @@ void App::render_one_frame() {
     ctx.player    = &player_;
     ctx.audio     = &audio_;
     ctx.exporter  = &exporter_;
+    ctx.thumbs    = &thumbs_;
     ctx.startup   = trace_;
     ctx.settings  = &settings_;
     ctx.show_settings    = &show_settings_;

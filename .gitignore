@@ -35,10 +35,9 @@ Makefile
 *.dylib
 *.ilk
 
-# ...except the vendored FFmpeg runtime + import libs.
-!third_party/ffmpeg/bin/*.dll
-!third_party/ffmpeg/lib/*.dll.a
-!third_party/ffmpeg/lib/*.lib
+# Vendored prebuilt FFmpeg (BtbN MinGW shared) is committed; opt out of the
+# blanket *.dll / *.a / *.lib rules above for everything under it.
+!third_party/ffmpeg/**
 
 # Logs / dumps
 *.log
