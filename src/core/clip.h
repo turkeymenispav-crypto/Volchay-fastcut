@@ -62,6 +62,19 @@ struct Clip {
     bool    selected = false;  // UI selection state (transient, not saved)
     float   opacity  = 1.0f;   // 0..1, only meaningful on overlay tracks
 
+    // Per-clip 2D transform applied in BOTH preview compositing and
+    // export. The transform is described in NORMALISED coordinates
+    // relative to the output frame:
+    //   scale = 1.0 means the picture fills the output as if it were
+    //           a top-track CapCut layer with no transform.
+    //   pos_x, pos_y are in [-1..1]; (0,0) keeps the picture centred,
+    //           (+1, 0) shifts the picture by one full output width to
+    //           the right (i.e. fully off-screen). The viewer's corner
+    //           handles edit scale; dragging the body edits pos_*.
+    float   scale    = 1.0f;
+    float   pos_x    = 0.0f;   // -1..1, 0 = centred
+    float   pos_y    = 0.0f;   // -1..1, 0 = centred
+
     TimeUs duration_on_timeline() const {
         TimeUs src_dur = src_out - src_in;
         if (src_dur < 0) src_dur = 0;

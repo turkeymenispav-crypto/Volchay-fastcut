@@ -46,10 +46,19 @@ private:
     // re-open both with the new path and seek to the correct FILE PTS.
     void sync_media_to_playhead();
 
+    // File > Extract audio. Writes the currently-open source's audio
+    // to <basename>.m4a alongside it via media::Exporter (audio_only
+    // request). Surfaces results to the user via a MessageBox.
+    void extract_audio_to_sidecar();
+
     Window                   window_;
     render::D3DContext       d3d_;
     core::Project            project_;
+    // Two video decoders: player_ (top track) + player_bot_ (the layer
+    // immediately below the topmost at the playhead). Both run in
+    // parallel so the viewer can composite V_n over V_{n-1}.
     media::MfPlayer          player_;
+    media::MfPlayer          player_bot_;
     media::AudioPlayer       audio_;
     media::Exporter          exporter_;
     ui::MainLayout           layout_;
@@ -72,6 +81,7 @@ private:
     // different file — e.g. as the playhead crosses from a clip
     // referencing video A into a clip referencing video B.
     std::wstring             current_media_path_;
+    std::wstring             current_media_path_bot_;
 };
 
 }  // namespace volchay::app

@@ -81,6 +81,15 @@ public:
     // or returns -1 if no clip covers t.
     TimeUs source_time_at(TimeUs t, const Clip** out_clip = nullptr) const;
 
+    // Layered query for the compositor. Returns the (up to 2) clips
+    // covering `t`, sorted top-track first. out[0] is the topmost,
+    // out[1] is the second-topmost (the layer immediately below). Each
+    // can be nullptr if no clip exists on that level. Used by the
+    // preview viewer to render V0 under V1 + by the export pipeline to
+    // composite tracks.
+    void clips_at(TimeUs t, const Clip** out_top,
+                            const Clip** out_bot) const;
+
     // Selection helpers.
     void clear_selection();
     bool any_selected() const;

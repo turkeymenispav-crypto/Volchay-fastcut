@@ -30,8 +30,10 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 #include <string>
 
 namespace volchay::media {
@@ -150,11 +152,256 @@ void Exporter::worker_main() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Audio-only extract. Pulls the first audio stream from `req.source_path`,
+// re-encodes it to AAC, muxes into .m4a / .aac at `req.output_path`. No
+// video stream is touched. Used by File > Extract audio.
+// ---------------------------------------------------------------------------
+static void run_audio_only_export(const ExportRequest& req,
+                                  std::atomic<float>& progress,
+                                  std::atomic<bool>&  cancel,
+                                  std::atomic<bool>&  success,
+                                  std::function<void(std::string)> set_status) {
+    set_status("Opening source...");
+    AVFormatContext* in_fmt = nullptr;
+    int err = avformat_open_input(&in_fmt,
+        narrow_path(req.source_path).c_str(), nullptr, nullptr);
+    if (err < 0) { set_status("Cannot open source: " + averr(err)); return; }
+    if (avformat_find_stream_info(in_fmt, nullptr) < 0) {
+        set_status("Cannot probe streams"); avformat_close_input(&in_fmt); return;
+    }
+
+    int a_idx = av_find_best_stream(in_fmt, AVMEDIA_TYPE_AUDIO,
+                                    -1, -1, nullptr, 0);
+    if (a_idx < 0) {
+        set_status("No audio stream in source");
+        avformat_close_input(&in_fmt);
+        return;
+    }
+    AVStream* a_in = in_fmt->streams[a_idx];
+    const AVCodec* a_dec = avcodec_find_decoder(a_in->codecpar->codec_id);
+    if (!a_dec) {
+        set_status("No decoder for audio codec");
+        avformat_close_input(&in_fmt);
+        return;
+    }
+    AVCodecContext* a_dec_ctx = avcodec_alloc_context3(a_dec);
+    avcodec_parameters_to_context(a_dec_ctx, a_in->codecpar);
+    if (avcodec_open2(a_dec_ctx, a_dec, nullptr) < 0) {
+        set_status("Open audio decoder failed");
+        avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
+    }
+
+    set_status("Opening output...");
+    const std::string out_path = narrow_path(req.output_path);
+    // mp4/m4a both work for AAC. Pick by extension if .aac, otherwise m4a.
+    const char* fmt_name = "mp4";
+    if (out_path.size() >= 4) {
+        const char* ext = out_path.c_str() + out_path.size() - 4;
+        if (_stricmp(ext, ".aac") == 0) fmt_name = "adts";
+    }
+    AVFormatContext* out_fmt = nullptr;
+    err = avformat_alloc_output_context2(&out_fmt, nullptr, fmt_name,
+                                         out_path.c_str());
+    if (err < 0 || !out_fmt) {
+        set_status("Create output failed: " + averr(err));
+        avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
+    }
+
+    const AVCodec* a_enc = avcodec_find_encoder(AV_CODEC_ID_AAC);
+    if (!a_enc) {
+        set_status("No AAC encoder available");
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
+    }
+    AVCodecContext* a_enc_ctx = avcodec_alloc_context3(a_enc);
+    a_enc_ctx->sample_rate = (a_dec_ctx->sample_rate > 0)
+                             ? a_dec_ctx->sample_rate : 48000;
+    a_enc_ctx->bit_rate    = req.audio_bitrate ? req.audio_bitrate : 192000;
+    a_enc_ctx->sample_fmt  = AV_SAMPLE_FMT_FLTP;
+    av_channel_layout_default(&a_enc_ctx->ch_layout, 2);
+    a_enc_ctx->time_base   = AVRational{1, a_enc_ctx->sample_rate};
+    if (out_fmt->oformat->flags & AVFMT_GLOBALHEADER) {
+        a_enc_ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+    if (avcodec_open2(a_enc_ctx, a_enc, nullptr) < 0) {
+        set_status("Open AAC encoder failed");
+        avcodec_free_context(&a_enc_ctx);
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
+    }
+    AVStream* a_out = avformat_new_stream(out_fmt, nullptr);
+    avcodec_parameters_from_context(a_out->codecpar, a_enc_ctx);
+    a_out->time_base = a_enc_ctx->time_base;
+
+    SwrContext* swr = nullptr;
+    AVChannelLayout in_layout;
+    if (a_dec_ctx->ch_layout.order != AV_CHANNEL_ORDER_UNSPEC) {
+        av_channel_layout_copy(&in_layout, &a_dec_ctx->ch_layout);
+    } else {
+        av_channel_layout_default(&in_layout,
+                                  a_dec_ctx->ch_layout.nb_channels);
+    }
+    AVChannelLayout out_layout;
+    av_channel_layout_default(&out_layout, 2);
+    swr_alloc_set_opts2(&swr,
+        &out_layout, a_enc_ctx->sample_fmt, a_enc_ctx->sample_rate,
+        &in_layout,  a_dec_ctx->sample_fmt, a_dec_ctx->sample_rate,
+        0, nullptr);
+    if (!swr || swr_init(swr) < 0) {
+        set_status("Resampler init failed");
+        if (swr) swr_free(&swr);
+        avcodec_free_context(&a_enc_ctx);
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
+    }
+    av_channel_layout_uninit(&in_layout);
+    av_channel_layout_uninit(&out_layout);
+
+    if (!(out_fmt->oformat->flags & AVFMT_NOFILE)) {
+        err = avio_open(&out_fmt->pb, out_path.c_str(), AVIO_FLAG_WRITE);
+        if (err < 0) {
+            set_status("avio_open failed: " + averr(err));
+            swr_free(&swr);
+            avcodec_free_context(&a_enc_ctx);
+            avformat_free_context(out_fmt);
+            avcodec_free_context(&a_dec_ctx);
+            avformat_close_input(&in_fmt);
+            return;
+        }
+    }
+    if (avformat_write_header(out_fmt, nullptr) < 0) {
+        set_status("write_header failed");
+        if (out_fmt->pb) avio_closep(&out_fmt->pb);
+        swr_free(&swr);
+        avcodec_free_context(&a_enc_ctx);
+        avformat_free_context(out_fmt);
+        avcodec_free_context(&a_dec_ctx);
+        avformat_close_input(&in_fmt);
+        return;
+    }
+
+    int64_t total_us = 0;
+    if (in_fmt->duration != AV_NOPTS_VALUE) {
+        total_us = av_rescale_q(in_fmt->duration,
+                                AVRational{1, AV_TIME_BASE},
+                                AVRational{1, 1'000'000});
+    }
+    if (total_us <= 0) total_us = 1;
+
+    AVPacket* pkt    = av_packet_alloc();
+    AVPacket* enc_pkt= av_packet_alloc();
+    AVFrame*  in_f   = av_frame_alloc();
+    AVFrame*  out_f  = av_frame_alloc();
+    out_f->format         = a_enc_ctx->sample_fmt;
+    out_f->sample_rate    = a_enc_ctx->sample_rate;
+    av_channel_layout_copy(&out_f->ch_layout, &a_enc_ctx->ch_layout);
+    out_f->nb_samples     = a_enc_ctx->frame_size > 0 ? a_enc_ctx->frame_size : 1024;
+    av_frame_get_buffer(out_f, 0);
+
+    int64_t a_pts_count = 0;
+    bool failed = false;
+
+    auto encode_frame = [&](AVFrame* f) -> int {
+        int rc = avcodec_send_frame(a_enc_ctx, f);
+        if (rc < 0 && rc != AVERROR(EAGAIN)) return rc;
+        while (true) {
+            rc = avcodec_receive_packet(a_enc_ctx, enc_pkt);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+            if (rc < 0) return rc;
+            enc_pkt->stream_index = a_out->index;
+            av_packet_rescale_ts(enc_pkt, a_enc_ctx->time_base,
+                                 a_out->time_base);
+            int wr = av_interleaved_write_frame(out_fmt, enc_pkt);
+            av_packet_unref(enc_pkt);
+            if (wr < 0) return wr;
+        }
+        return 0;
+    };
+
+    while (!cancel.load()) {
+        err = av_read_frame(in_fmt, pkt);
+        if (err < 0) break;
+        if (pkt->stream_index != a_idx) {
+            av_packet_unref(pkt);
+            continue;
+        }
+        int rc = avcodec_send_packet(a_dec_ctx, pkt);
+        av_packet_unref(pkt);
+        if (rc < 0 && rc != AVERROR(EAGAIN)) continue;
+        while (true) {
+            rc = avcodec_receive_frame(a_dec_ctx, in_f);
+            if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) break;
+            if (rc < 0) { failed = true; break; }
+            int64_t pts_us = av_rescale_q(in_f->best_effort_timestamp,
+                                          a_in->time_base,
+                                          AVRational{1, 1'000'000});
+            // Resample into out_f-sized chunks.
+            const uint8_t** in_data = (const uint8_t**)in_f->data;
+            int in_nb = in_f->nb_samples;
+            while (in_nb > 0 || swr_get_delay(swr, a_enc_ctx->sample_rate)) {
+                int got = swr_convert(swr, out_f->data, out_f->nb_samples,
+                                      in_data, in_nb);
+                in_data = nullptr;
+                in_nb   = 0;
+                if (got <= 0) break;
+                out_f->pts        = a_pts_count;
+                out_f->nb_samples = got;
+                a_pts_count += got;
+                int wr = encode_frame(out_f);
+                if (wr < 0) { failed = true; break; }
+            }
+            av_frame_unref(in_f);
+            if (total_us > 0) {
+                progress.store(std::clamp(float(double(pts_us) / total_us),
+                                          0.0f, 0.99f));
+            }
+        }
+        if (failed) break;
+    }
+    encode_frame(nullptr);  // flush
+    av_write_trailer(out_fmt);
+
+    av_packet_free(&pkt);
+    av_packet_free(&enc_pkt);
+    av_frame_free(&in_f);
+    av_frame_free(&out_f);
+    swr_free(&swr);
+    if (out_fmt->pb) avio_closep(&out_fmt->pb);
+    avcodec_free_context(&a_enc_ctx);
+    avformat_free_context(out_fmt);
+    avcodec_free_context(&a_dec_ctx);
+    avformat_close_input(&in_fmt);
+
+    if (!failed && !cancel.load()) {
+        progress.store(1.0f);
+        success.store(true);
+        set_status("Audio extracted.");
+    } else {
+        set_status(cancel.load() ? "Cancelled." : "Audio extract failed.");
+    }
+}
+
 void Exporter::run_one_export(ExportRequest req) {
     auto set_status = [&](std::string s) {
         std::lock_guard lk(mu_);
         status_ = std::move(s);
     };
+
+    if (req.audio_only) {
+        run_audio_only_export(req, progress_, cancel_, success_, set_status);
+        return;
+    }
 
     set_status("Opening source...");
 

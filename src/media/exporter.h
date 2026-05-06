@@ -48,6 +48,12 @@ struct ExportRequest {
     // original first). The exporter itself never deletes any file.
     bool         replace_source     = false;
     std::wstring replace_final_path;
+
+    // Audio-only export: skip the video stream entirely and write a
+    // bare AAC track inside an .m4a container at output_path. All
+    // video fields (codec/width/height/fps/bitrate/aspect_ratio) are
+    // ignored. Used by File > Extract audio.
+    bool         audio_only         = false;
 };
 
 // A small label library the UI uses to populate the codec / resolution

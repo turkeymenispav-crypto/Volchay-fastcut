@@ -21,7 +21,8 @@ class ThumbnailCache;
 // Aggregated state passed to every panel each frame.
 struct EditorContext {
     core::Project*           project   = nullptr;
-    media::MfPlayer*         player    = nullptr;
+    media::MfPlayer*         player    = nullptr;   // top track
+    media::MfPlayer*         player_bot = nullptr;  // layer below topmost
     media::AudioPlayer*      audio     = nullptr;
     media::Exporter*         exporter  = nullptr;
     ThumbnailCache*          thumbs    = nullptr;
@@ -45,6 +46,12 @@ struct EditorContext {
     // menu / drag&drop. Implemented by App.
     std::function<void(const std::wstring& path)> open_file;
     std::function<void()> exit_app;
+
+    // Triggered from File > Extract audio. Implemented by App: writes
+    // the active source's audio track to <basename>.m4a next to the
+    // source. No GUI of its own; results are surfaced via a status
+    // toast / message box.
+    std::function<void()> extract_audio;
 
     // Wall-clock since app launched, for status bar.
     double session_seconds = 0.0;

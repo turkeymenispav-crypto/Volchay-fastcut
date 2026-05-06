@@ -174,6 +174,24 @@ void Project::set_playhead(TimeUs t) {
     playhead_ = t;
 }
 
+void Project::clips_at(TimeUs t, const Clip** out_top,
+                                  const Clip** out_bot) const {
+    const Clip* top = nullptr;
+    const Clip* bot = nullptr;
+    for (const auto& c : clips_) {
+        if (t < c.t_in || t >= c.t_out()) continue;
+        if (!top || c.track > top->track) {
+            bot = top;
+            top = &c;
+        } else if (!bot || c.track > bot->track) {
+            // Only take a "bot" if it sits below the top.
+            if (c.track < top->track) bot = &c;
+        }
+    }
+    if (out_top) *out_top = top;
+    if (out_bot) *out_bot = bot;
+}
+
 TimeUs Project::source_time_at(TimeUs t, const Clip** out_clip) const {
     // Pick the topmost (highest track number) clip whose timeline span
     // covers t. This is what "what should the audio engine load right

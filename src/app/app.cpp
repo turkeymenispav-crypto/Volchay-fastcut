@@ -233,45 +233,105 @@ void App::advance_playhead(double dt_seconds) {
     project_.set_playhead(ph);
 }
 
+void App::extract_audio_to_sidecar() {
+    if (current_media_path_.empty()) {
+        ::MessageBoxW(window_.hwnd(),
+                      L"No video is open.",
+                      L"Volchay-fastcut",
+                      MB_ICONINFORMATION | MB_OK);
+        return;
+    }
+    if (exporter_.busy()) {
+        ::MessageBoxW(window_.hwnd(),
+                      L"An export is already running. Wait for it to finish.",
+                      L"Volchay-fastcut",
+                      MB_ICONINFORMATION | MB_OK);
+        return;
+    }
+    // Build sibling .m4a path: <stem>.m4a alongside the source.
+    std::wstring out = current_media_path_;
+    size_t dot = out.find_last_of(L'.');
+    size_t sep = out.find_last_of(L"/\\");
+    if (dot != std::wstring::npos && (sep == std::wstring::npos || dot > sep)) {
+        out.resize(dot);
+    }
+    out += L".m4a";
+
+    media::ExportRequest req;
+    req.source_path    = current_media_path_;
+    req.output_path    = out;
+    req.audio_only     = true;
+    req.audio_bitrate  = 192000;
+    if (!exporter_.start(req)) {
+        ::MessageBoxW(window_.hwnd(),
+                      L"Failed to start audio extract.",
+                      L"Volchay-fastcut",
+                      MB_ICONERROR | MB_OK);
+        return;
+    }
+    ::MessageBoxW(window_.hwnd(),
+                  L"Extracting audio... Progress is shown in the status bar; "
+                  L"the .m4a file will appear next to your source when done.",
+                  L"Volchay-fastcut",
+                  MB_ICONINFORMATION | MB_OK);
+}
+
 void App::sync_media_to_playhead() {
     if (project_.clips().empty()) return;
 
-    const core::Clip* active = nullptr;
-    (void)project_.source_time_at(project_.playhead(), &active);
-    if (!active) return;
+    const core::Clip* top = nullptr;
+    const core::Clip* bot = nullptr;
+    project_.clips_at(project_.playhead(), &top, &bot);
 
-    const core::Media* m = project_.find_media(active->media_id);
-    if (!m) return;
-
-    if (m->path == current_media_path_) return;
-    const std::wstring wanted = m->path;
-
-    // Crossed a clip boundary into a clip whose source media is not
-    // loaded in the AV decoder + audio engine yet. Re-open both, then
-    // seek inside the new file to the FILE PTS that corresponds to the
-    // current playhead position inside the new clip.
-    log::info("sync_media_to_playhead: switching to %s",
-              volchay::narrow(wanted).c_str());
-
-    player_.set_prefer_hardware(settings_.hardware_decode);
-    if (player_.open(wanted, d3d_.device())) {
-        current_media_path_ = wanted;
-    } else {
-        log::err("sync_media_to_playhead: failed to open %s",
-                 volchay::narrow(wanted).c_str());
-        return;
+    // ---- Top track / audio master ----
+    if (top) {
+        const core::Media* m = project_.find_media(top->media_id);
+        if (m && m->path != current_media_path_) {
+            const std::wstring wanted = m->path;
+            log::info("sync_media_to_playhead: TOP -> %s",
+                      volchay::narrow(wanted).c_str());
+            player_.set_prefer_hardware(settings_.hardware_decode);
+            if (player_.open(wanted, d3d_.device())) {
+                current_media_path_ = wanted;
+            } else {
+                log::err("sync_media_to_playhead: TOP failed to open %s",
+                         volchay::narrow(wanted).c_str());
+            }
+            audio_.open(wanted);
+            audio_.set_volume(settings_.audio_volume);
+            audio_.set_muted(settings_.audio_mute);
+            const core::TimeUs file_t =
+                project_.source_time_at(project_.playhead());
+            if (file_t >= 0) {
+                player_.seek(file_t);
+                audio_.seek(file_t);
+            }
+            if (project_.is_playing()) audio_.play();
+        }
     }
 
-    audio_.open(wanted);
-    audio_.set_volume(settings_.audio_volume);
-    audio_.set_muted(settings_.audio_mute);
-
-    const core::TimeUs file_t = project_.source_time_at(project_.playhead());
-    if (file_t >= 0) {
-        player_.seek(file_t);
-        audio_.seek(file_t);
+    // ---- Bottom layer (decode-only, used by the viewer for layered
+    //      compositing). No audio mixing for now. ----
+    if (bot) {
+        const core::Media* m = project_.find_media(bot->media_id);
+        if (m && m->path != current_media_path_bot_) {
+            const std::wstring wanted = m->path;
+            log::info("sync_media_to_playhead: BOT -> %s",
+                      volchay::narrow(wanted).c_str());
+            player_bot_.set_prefer_hardware(settings_.hardware_decode);
+            if (player_bot_.open(wanted, d3d_.device())) {
+                current_media_path_bot_ = wanted;
+            } else {
+                log::err("sync_media_to_playhead: BOT failed to open %s",
+                         volchay::narrow(wanted).c_str());
+            }
+        }
+    } else if (!current_media_path_bot_.empty()) {
+        // No bottom layer at this playhead — close the player so the
+        // viewer renders a single layer cleanly.
+        player_bot_.close();
+        current_media_path_bot_.clear();
     }
-    if (project_.is_playing()) audio_.play();
 }
 
 void App::render_one_frame() {
@@ -302,14 +362,29 @@ void App::render_one_frame() {
     // FILE PTS inside the new file).
     sync_media_to_playhead();
 
-    if (player_.is_open()) {
-        // pump() wants FILE PTS, not timeline PTS — translate through
-        // the active clip so trimmed/split layouts request the right
-        // source frame.
+    {
         const core::TimeUs tl = project_.playhead();
-        core::TimeUs file_t = project_.source_time_at(tl);
-        if (file_t < 0) file_t = tl;
-        player_.pump(file_t);
+        const core::Clip* top = nullptr;
+        const core::Clip* bot = nullptr;
+        project_.clips_at(tl, &top, &bot);
+
+        if (top && player_.is_open()) {
+            // pump() wants FILE PTS, not timeline PTS — translate
+            // through the active clip so trimmed/split layouts
+            // request the right source frame.
+            const core::TimeUs offset = tl - top->t_in;
+            core::TimeUs file_t =
+                top->src_in + core::TimeUs(double(offset) * top->speed);
+            if (file_t < 0) file_t = tl;
+            player_.pump(file_t);
+        }
+        if (bot && player_bot_.is_open()) {
+            const core::TimeUs offset = tl - bot->t_in;
+            core::TimeUs file_t =
+                bot->src_in + core::TimeUs(double(offset) * bot->speed);
+            if (file_t < 0) file_t = tl;
+            player_bot_.pump(file_t);
+        }
     }
 
     // Apply audio settings every frame (cheap atomics). The effective
@@ -337,10 +412,11 @@ void App::render_one_frame() {
     ImGui::NewFrame();
 
     ui::EditorContext ctx;
-    ctx.project   = &project_;
-    ctx.player    = &player_;
-    ctx.audio     = &audio_;
-    ctx.exporter  = &exporter_;
+    ctx.project    = &project_;
+    ctx.player     = &player_;
+    ctx.player_bot = &player_bot_;
+    ctx.audio      = &audio_;
+    ctx.exporter   = &exporter_;
     ctx.thumbs    = &thumbs_;
     ctx.startup   = trace_;
     ctx.settings  = &settings_;
@@ -351,6 +427,7 @@ void App::render_one_frame() {
     ctx.last_frame_ms   = last_frame_ms_;
     ctx.open_file       = [this](const std::wstring& p) { open_video(p); };
     ctx.exit_app        = [this]() { window_.request_close(); };
+    ctx.extract_audio   = [this]() { extract_audio_to_sidecar(); };
 
     layout_.render(ctx);
 

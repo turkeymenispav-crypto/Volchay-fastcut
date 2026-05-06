@@ -67,6 +67,9 @@ void MainLayout::draw_menu_bar(EditorContext& ctx) {
         if (ImGui::MenuItem("Export...", "Ctrl+E", false, can_export)) {
             if (ctx.show_export) *ctx.show_export = true;
         }
+        if (ImGui::MenuItem("Extract audio...", nullptr, false, can_export)) {
+            if (ctx.extract_audio) ctx.extract_audio();
+        }
         ImGui::Separator();
         if (ImGui::MenuItem("Register context menu...")) {
             LONG e = volchay::shell::register_context_menu(true);
