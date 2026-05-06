@@ -737,20 +737,55 @@ void Exporter::run_one_export(ExportRequest req) {
     // ------------------------------------------------------------------
     set_status("Encoding...");
 
-    // sws_scale runs on the cropped sub-region of every decoded
-    // frame. Per-frame we offset dec_frame->data[] pointers using
-    // the crop_x/crop_y origin computed above; the linesize stays the
-    // same as the source.
+    // Per-clip transform inside the canvas. We mirror the viewer's
+    // model: scale grows/shrinks the picture, pos_x/pos_y in [-1..1]
+    // pan it in normalised half-frame units. Outside the picture is
+    // canvas black. When the transform is identity, we degenerate to
+    // the previous full-frame sws_scale.
+    const float xs = (req.xform_scale > 0.f) ? req.xform_scale : 1.0f;
+    const float xx = req.xform_pos_x;
+    const float xy = req.xform_pos_y;
+    const bool  has_xform = (xs != 1.0f) || (xx != 0.0f) || (xy != 0.0f);
+
+    int target_w = out_w, target_h = out_h, target_x = 0, target_y = 0;
+    int vx0 = 0, vy0 = 0, vw = out_w, vh = out_h;
+    int sx0 = crop_x, sy0 = crop_y, svw = crop_w, svh = crop_h;
+    if (has_xform) {
+        target_w = std::max(2, int(out_w * xs + 0.5f)) & ~1;
+        target_h = std::max(2, int(out_h * xs + 0.5f)) & ~1;
+        target_x = int(out_w * 0.5f + xx * out_w * 0.5f - target_w * 0.5f);
+        target_y = int(out_h * 0.5f + xy * out_h * 0.5f - target_h * 0.5f);
+
+        vx0 = std::max(0, target_x) & ~1;
+        vy0 = std::max(0, target_y) & ~1;
+        int vx1 = std::min(out_w, target_x + target_w) & ~1;
+        int vy1 = std::min(out_h, target_y + target_h) & ~1;
+        vw = std::max(2, vx1 - vx0);
+        vh = std::max(2, vy1 - vy0);
+
+        // Map the visible canvas rect back into the source crop rect.
+        sx0 = (crop_x + (vx0 - target_x) * crop_w / target_w) & ~1;
+        sy0 = (crop_y + (vy0 - target_y) * crop_h / target_h) & ~1;
+        int sx1 = (crop_x + (vx1 - target_x) * crop_w / target_w) & ~1;
+        int sy1 = (crop_y + (vy1 - target_y) * crop_h / target_h) & ~1;
+        svw = std::max(2, sx1 - sx0);
+        svh = std::max(2, sy1 - sy0);
+    }
+
+    // sws_scale runs on the visible source sub-region of every
+    // decoded frame. Per-frame we offset dec_frame->data[] pointers
+    // using the (sx0,sy0) origin computed above; linesize is
+    // unchanged.
     SwsContext* sws = sws_getContext(
-        crop_w, crop_h, v_dec_ctx->pix_fmt,
-        out_w, out_h, v_enc_ctx->pix_fmt,
+        svw, svh, v_dec_ctx->pix_fmt,
+        vw,  vh,  v_enc_ctx->pix_fmt,
         SWS_BILINEAR, nullptr, nullptr, nullptr);
 
-    // Helper: compute offset src_data pointers into a decoded frame
-    // for the centre-crop window. Linesize is unchanged. Works for
-    // any planar / semi-planar format (YUV420P, NV12, YUV422P, ...).
-    auto crop_offsets = [&](const AVFrame* f,
-                            uint8_t* out_data[4], int out_ls[4]) {
+    // Helper: compute offset data pointers into a planar / semi-
+    // planar frame at (off_x, off_y). Used for both the source-side
+    // crop and the destination-side transform offset.
+    auto plane_offsets = [&](const AVFrame* f, int off_x, int off_y,
+                             uint8_t* out_data[4], int out_ls[4]) {
         const AVPixelFormat fmt = (AVPixelFormat)f->format;
         const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fmt);
         int bps[4]  = {1, 1, 1, 1};
@@ -776,8 +811,29 @@ void Exporter::run_one_export(ExportRequest req) {
                 continue;
             }
             out_data[p] = f->data[p]
-                + (crop_y >> vsub[p]) * f->linesize[p]
-                + (crop_x >> hsub[p]) * bps[p];
+                + (off_y >> vsub[p]) * f->linesize[p]
+                + (off_x >> hsub[p]) * bps[p];
+        }
+    };
+
+    auto crop_offsets = [&](const AVFrame* f,
+                            uint8_t* out_data[4], int out_ls[4]) {
+        plane_offsets(f, sx0, sy0, out_data, out_ls);
+    };
+
+    // Black-fill the encoder canvas. For YUV420P / YUV422P / YUV444P
+    // we set Y=0 and chroma=128 (neutral gray). For NV12 the chroma
+    // plane is interleaved UV at the same neutral.
+    auto fill_canvas_black = [&](AVFrame* f) {
+        const AVPixelFormat fmt = (AVPixelFormat)f->format;
+        if (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUV422P
+         || fmt == AV_PIX_FMT_YUV444P) {
+            std::memset(f->data[0], 0,   f->linesize[0] * f->height);
+            std::memset(f->data[1], 128, f->linesize[1] * f->height);
+            std::memset(f->data[2], 128, f->linesize[2] * f->height);
+        } else if (fmt == AV_PIX_FMT_NV12) {
+            std::memset(f->data[0], 0,   f->linesize[0] * f->height);
+            std::memset(f->data[1], 128, f->linesize[1] * f->height);
         }
     };
 
@@ -866,16 +922,27 @@ void Exporter::run_one_export(ExportRequest req) {
                 progress_.store(float(double(pts_us - req.trim_start_us) /
                                       double(span_us)));
 
-                // Crop + convert + scale to encoder pix_fmt. When the
-                // user picked a non-source AR, src_data points into
-                // the centre-crop region of dec_frame; otherwise it's
-                // the full frame.
+                // Crop + convert + scale + transform into the encoder
+                // canvas. When transform is identity the destination
+                // covers the whole canvas; otherwise we black-fill
+                // the canvas first then sws_scale into a sub-rect at
+                // (vx0, vy0).
                 if (sws) {
                     uint8_t* src_data[4];
                     int      src_ls[4];
                     crop_offsets(dec_frame, src_data, src_ls);
-                    sws_scale(sws, src_data, src_ls, 0, crop_h,
-                              enc_frame->data, enc_frame->linesize);
+                    if (has_xform) {
+                        fill_canvas_black(enc_frame);
+                        uint8_t* dst_data[4];
+                        int      dst_ls[4];
+                        plane_offsets(enc_frame, vx0, vy0,
+                                      dst_data, dst_ls);
+                        sws_scale(sws, src_data, src_ls, 0, svh,
+                                  dst_data, dst_ls);
+                    } else {
+                        sws_scale(sws, src_data, src_ls, 0, svh,
+                                  enc_frame->data, enc_frame->linesize);
+                    }
                 }
                 enc_frame->pts = v_pts_count++;
                 int rc2 = encode_video_frame(enc_frame);
@@ -948,8 +1015,18 @@ void Exporter::run_one_export(ExportRequest req) {
                 uint8_t* src_data[4];
                 int      src_ls[4];
                 crop_offsets(dec_frame, src_data, src_ls);
-                sws_scale(sws, src_data, src_ls, 0, crop_h,
-                          enc_frame->data, enc_frame->linesize);
+                if (has_xform) {
+                    fill_canvas_black(enc_frame);
+                    uint8_t* dst_data[4];
+                    int      dst_ls[4];
+                    plane_offsets(enc_frame, vx0, vy0,
+                                  dst_data, dst_ls);
+                    sws_scale(sws, src_data, src_ls, 0, svh,
+                              dst_data, dst_ls);
+                } else {
+                    sws_scale(sws, src_data, src_ls, 0, svh,
+                              enc_frame->data, enc_frame->linesize);
+                }
             }
             enc_frame->pts = v_pts_count++;
             encode_video_frame(enc_frame);

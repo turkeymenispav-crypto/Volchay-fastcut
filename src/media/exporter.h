@@ -54,6 +54,16 @@ struct ExportRequest {
     // video fields (codec/width/height/fps/bitrate/aspect_ratio) are
     // ignored. Used by File > Extract audio.
     bool         audio_only         = false;
+
+    // Per-clip transform for the (currently single-source) export
+    // pipeline. Carries the active clip's transform so the encoded
+    // file matches what's shown in the viewer:
+    //   xform_scale > 0 zooms the picture (1.0 = no scale).
+    //   xform_pos_x / xform_pos_y are in [-1..1], 0 = centred. Outside
+    //   the picture rectangle the canvas is filled with black.
+    float        xform_scale  = 1.0f;
+    float        xform_pos_x  = 0.0f;
+    float        xform_pos_y  = 0.0f;
 };
 
 // A small label library the UI uses to populate the codec / resolution

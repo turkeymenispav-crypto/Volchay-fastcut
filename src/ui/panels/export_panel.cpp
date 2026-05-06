@@ -349,6 +349,16 @@ void draw_export(EditorContext& ctx) {
                 r.aspect_ratio  = aspect_values[aspect_idx];
                 r.trim_start_us = export_src_in;
                 r.trim_end_us   = export_src_out;
+                // Carry the active clip's transform through to the
+                // export pipeline. Without this the encoded file
+                // would ignore any zoom/pan the user applied in the
+                // viewer.
+                if (ctx.project && !ctx.project->clips().empty()) {
+                    const core::Clip& c = ctx.project->clips().front();
+                    r.xform_scale = c.scale;
+                    r.xform_pos_x = c.pos_x;
+                    r.xform_pos_y = c.pos_y;
+                }
             };
 
             // Centered button row.
