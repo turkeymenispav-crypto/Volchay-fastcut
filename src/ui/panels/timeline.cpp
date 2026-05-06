@@ -195,7 +195,11 @@ void draw_timeline(EditorContext& ctx) {
     // stack (CapCut convention — overlays float above the base video).
     int data_tracks = project->video_track_count();
     int n_tracks    = std::max(data_tracks, 1 + extra_overlay_rows);
-    const float tracks_h = n_tracks * (track_h + track_gap) - track_gap;
+    int n_audio     = project->audio_track_count();
+    const float track_audio_h = 36.f;
+    const float tracks_h = n_tracks    * (track_h + track_gap)
+                        +  n_audio     * (track_audio_h + track_gap)
+                        + (n_audio > 0 ? track_gap : -track_gap);
 
     ImVec2 avail  = ImGui::GetContentRegionAvail();
     avail.y       = std::max(tracks_h + ruler_h + 8.f, avail.y);
@@ -291,9 +295,21 @@ void draw_timeline(EditorContext& ctx) {
     // the screen-y of the top of row i.
     const float lanes_top = c.y + ruler_h + 4.f;
     auto row_y = [&](int track) {
-        // track == 0 sits at lanes_top + (n-1) * (h+gap)
-        const int row_from_top = n_tracks - 1 - track;
-        return lanes_top + row_from_top * (track_h + track_gap);
+        if (track >= 0) {
+            // Video lanes: track 0 sits at the BOTTOM of the video
+            // stack, higher indices float above.
+            const int row_from_top = n_tracks - 1 - track;
+            return lanes_top + row_from_top * (track_h + track_gap);
+        }
+        // Audio lanes: A1 (track == -1) sits just below V1; A2 below
+        // A1 etc. Audio rows are shorter (track_audio_h).
+        const float audio_top = lanes_top + n_tracks * (track_h + track_gap)
+                              + track_gap;
+        const int   a_idx = -track - 1;   // -1 -> 0, -2 -> 1, ...
+        return audio_top + a_idx * (track_audio_h + track_gap);
+    };
+    auto row_h = [&](int track) {
+        return track >= 0 ? track_h : track_audio_h;
     };
 
     // Backwards-compat aliases for the existing main-track code paths
@@ -313,22 +329,42 @@ void draw_timeline(EditorContext& ctx) {
         dl->AddText(ImVec2(c.x + 4, y0 + 4),
                     ImGui::GetColorU32(theme().text_dim), lbl);
     }
+    // Audio lane backgrounds + labels.
+    for (int a_idx = 0; a_idx < n_audio; ++a_idx) {
+        const int   track = -(a_idx + 1);
+        const float y0 = row_y(track);
+        const float y1 = y0 + track_audio_h;
+        const ImU32 lane_bg = ImGui::GetColorU32(
+            ImVec4(0.10f, 0.13f, 0.16f, 1.0f));
+        dl->AddRectFilled(ImVec2(c.x, y0), ImVec2(c.x + total_w, y1), lane_bg);
+        char lbl[8]; std::snprintf(lbl, sizeof(lbl), "A%d", a_idx + 1);
+        dl->AddText(ImVec2(c.x + 4, y0 + 4),
+                    ImGui::GetColorU32(theme().text_dim), lbl);
+    }
     const ImGuiIO& io = ImGui::GetIO();
 
     // Clips: render + per-clip interaction (select, drag-trim).
     auto& clips = project->clips_mut();
     bool any_clip_hovered = false;
+    static std::string ctx_menu_clip_id;   // remembered across frames
     for (auto& clip : clips) {
         const float x0 = c.x + float(double(clip.t_in)    * px_per_us(zoom));
         const float x1 = c.x + float(double(clip.t_out()) * px_per_us(zoom));
         const float y0 = row_y(clip.track);
-        const float y1 = y0 + track_h;
+        const float y1 = y0 + row_h(clip.track);
         const ImVec2 a(x0, y0 + 4);
         const ImVec2 b(x1, y1 - 4);
 
-        const ImU32 fill = clip.selected
-            ? ImGui::GetColorU32(theme().accent)
-            : ImGui::GetColorU32(theme().timeline_clip);
+        const bool   is_audio = clip.track < 0;
+        const ImVec4 audio_fill   = ImVec4(0.30f, 0.55f, 0.62f, 1.00f);
+        const ImVec4 audio_select = ImVec4(0.55f, 0.85f, 0.92f, 1.00f);
+        ImU32 fill;
+        if (clip.selected) {
+            fill = ImGui::GetColorU32(is_audio ? audio_select : theme().accent);
+        } else {
+            fill = ImGui::GetColorU32(is_audio ? audio_fill
+                                              : theme().timeline_clip);
+        }
         dl->AddRectFilled(a, b, fill, theme().corner_radius);
         dl->AddRect(a, b,
                     ImGui::GetColorU32(theme().timeline_clip_sel),
@@ -340,12 +376,26 @@ void draw_timeline(EditorContext& ctx) {
             std::string label = clip.media_id;
             auto pos = label.find_last_of("/\\");
             if (pos != std::string::npos) label = label.substr(pos + 1);
+            if (is_audio) label = std::string("\xf0\x9f\x94\x8a ") + label;
             ImVec2 tsz = ImGui::CalcTextSize(label.c_str());
             if (tsz.x < clip_w - 10.f) {
-                dl->AddText(ImVec2(x0 + 6, y0 + (track_h - tsz.y) * 0.5f),
+                dl->AddText(ImVec2(x0 + 6,
+                                   y0 + (row_h(clip.track) - tsz.y) * 0.5f),
                             ImGui::GetColorU32(theme().text),
                             label.c_str());
             }
+        }
+        // Muted-source indicator: tiny "Mute" pill in the corner so the
+        // user can see at a glance that the audio of this video clip
+        // has been detached to an A-track.
+        if (!is_audio && clip.muted) {
+            const ImVec2 pa(x0 + 4, y1 - 18);
+            const ImVec2 pb(x0 + 36, y1 - 4);
+            dl->AddRectFilled(pa, pb,
+                              IM_COL32(40, 40, 50, 220), 4.f);
+            dl->AddText(ImVec2(pa.x + 4, pa.y + 1),
+                        ImGui::GetColorU32(theme().text_dim),
+                        "muted");
         }
 
         // Hit regions: 6px on each edge are trim handles, the middle is select.
@@ -399,6 +449,69 @@ void draw_timeline(EditorContext& ctx) {
                 ImVec2(over_left ? x0 + handle_w : x1, b.y),
                 IM_COL32(255, 165, 60, 200));
         }
+
+        // Right-click on a clip: select it and remember its id; we
+        // open the popup AFTER the clip loop so the popup itself isn't
+        // re-anchored every frame, and so dispatch can call
+        // project->...() without invalidating `clip`.
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) && inside) {
+            if (!io.KeyCtrl) project->clear_selection();
+            clip.selected      = true;
+            ctx_menu_clip_id   = clip.id;
+            ImGui::OpenPopup("##clip_ctx");
+        }
+    }
+    // ---- Right-click context menu for the clip whose id is held in
+    //      ctx_menu_clip_id. Popup is anchored where ImGui::OpenPopup
+    //      was issued (under the mouse on right-click). ----
+    if (ImGui::BeginPopup("##clip_ctx")) {
+        // Find the clip again by id (clips_ may have been mutated).
+        core::Clip* sel = nullptr;
+        for (auto& cc : project->clips_mut()) {
+            if (cc.id == ctx_menu_clip_id) { sel = &cc; break; }
+        }
+        if (sel) {
+            const bool is_aud = sel->track < 0;
+            if (!is_aud) {
+                const bool can_extract = !sel->muted;
+                if (ImGui::MenuItem("Extract audio to A-track",
+                                    nullptr, false, can_extract)) {
+                    project->extract_audio_from(sel->id);
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Detach this clip's audio onto a separate "
+                        "audio track. The video clip becomes muted; "
+                        "the audio clip can be moved or deleted "
+                        "independently.");
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem(sel->muted ? "Unmute video"
+                                               : "Mute video")) {
+                    sel->muted = !sel->muted;
+                    project->mark_dirty();
+                }
+            } else {
+                if (ImGui::MenuItem("Delete audio clip")) {
+                    project->clear_selection();
+                    sel->selected = true;
+                    project->delete_selected(false);
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete clip", "Del")) {
+                project->clear_selection();
+                if (auto* s = [&]() -> core::Clip* {
+                    for (auto& cc : project->clips_mut())
+                        if (cc.id == ctx_menu_clip_id) return &cc;
+                    return nullptr;
+                }()) {
+                    s->selected = true;
+                    project->delete_selected(ripple_delete);
+                }
+            }
+        }
+        ImGui::EndPopup();
     }
 
     // Transition badges on clip boundaries. We draw them as a small

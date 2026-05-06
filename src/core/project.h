@@ -43,6 +43,20 @@ public:
     // Total number of currently-occupied video tracks (max(track)+1).
     int video_track_count() const;
 
+    // Total number of currently-occupied audio tracks (audio clips
+    // live on track <= -1 and use abs(track) to identify A1 / A2 / ...
+    // — see Clip::track in core/clip.h). Returns 0 when no audio
+    // tracks are in use.
+    int audio_track_count() const;
+
+    // Detach the audio of `video_clip_id` into a new clip living on
+    // a dedicated audio track (the next free A-track, allocating one
+    // if necessary). The original video clip is muted so playback
+    // doesn't double up. Returns the id of the new audio clip, or
+    // empty string if nothing was changed (no clip with that id, or
+    // it was already muted + has a sibling audio clip).
+    std::string extract_audio_from(const std::string& video_clip_id);
+
     // Remove all clips.
     void clear_clips();
 

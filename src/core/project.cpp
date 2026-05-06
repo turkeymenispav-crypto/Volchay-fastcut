@@ -113,6 +113,59 @@ int Project::video_track_count() const {
     return max_track + 1;
 }
 
+int Project::audio_track_count() const {
+    int min_track = 0;
+    for (const auto& c : clips_) if (c.track < min_track) min_track = c.track;
+    return -min_track;
+}
+
+std::string Project::extract_audio_from(const std::string& video_clip_id) {
+    Clip* src = nullptr;
+    for (auto& c : clips_) {
+        if (c.id == video_clip_id) { src = &c; break; }
+    }
+    if (!src || src->track < 0) return std::string{};
+
+    // Pick the lowest A-track index that's free for the time span the
+    // new audio clip will occupy. Audio tracks are stored as negative
+    // track values: A1 == -1, A2 == -2, ... The visual order in the
+    // timeline grows downward as |track| grows.
+    const TimeUs t0  = src->t_in;
+    const TimeUs t1  = src->t_out();
+    int audio_track  = -1;
+    for (int idx = -1; idx >= -16; --idx) {
+        bool collision = false;
+        for (const auto& c : clips_) {
+            if (c.track != idx) continue;
+            if (c.t_in >= t1 || c.t_out() <= t0) continue;
+            collision = true;
+            break;
+        }
+        if (!collision) { audio_track = idx; break; }
+    }
+
+    Clip aud;
+    aud.id         = "clip_" + std::to_string(next_clip_seq_++);
+    aud.media_id   = src->media_id;
+    aud.src_in     = src->src_in;
+    aud.src_out    = src->src_out;
+    aud.t_in       = src->t_in;
+    aud.track      = audio_track;
+    aud.speed      = src->speed;
+    aud.volume     = src->volume;
+    aud.muted      = false;
+    // Audio clips don't render any picture, so transform fields are
+    // ignored. Keep them at identity for save/restore consistency.
+    aud.scale = 1.0f; aud.pos_x = 0.0f; aud.pos_y = 0.0f;
+
+    // Mute the source video clip so we don't hear the same audio twice.
+    src->muted = true;
+
+    clips_.push_back(aud);
+    mark_dirty();
+    return clips_.back().id;
+}
+
 Clip& Project::set_single_clip(const std::string& media_id) {
     clips_.clear();
     Clip& c = append_clip(media_id);
@@ -176,9 +229,14 @@ void Project::set_playhead(TimeUs t) {
 
 void Project::clips_at(TimeUs t, const Clip** out_top,
                                   const Clip** out_bot) const {
+    // Picks the top + second-from-top VIDEO clip at time t. Audio
+    // sub-tracks (track < 0) are intentionally excluded — they don't
+    // contribute pictures and the viewer / exporter's compositing
+    // stage is the only consumer of this function.
     const Clip* top = nullptr;
     const Clip* bot = nullptr;
     for (const auto& c : clips_) {
+        if (c.track < 0) continue;
         if (t < c.t_in || t >= c.t_out()) continue;
         if (!top || c.track > top->track) {
             bot = top;

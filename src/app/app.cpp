@@ -198,18 +198,19 @@ void App::advance_playhead(double dt_seconds) {
         (void)project_.source_time_at(ph, &active);
         const core::Media* active_m =
             active ? project_.find_media(active->media_id) : nullptr;
-        if (active_m && active_m->path == current_media_path_) {
-            // We're playing inside a clip whose media matches the audio
-            // engine's currently-loaded file — apply a soft drift
-            // correction toward the audio master clock.
+        // The audio engine plays at the source's native sample rate,
+        // so its PTS only tracks wall-clock when the active clip is
+        // playing at 1.0x. For any other speed we'd snap the playhead
+        // to file_pts/speed and effectively cancel the slow-down. Skip
+        // drift correction in that case and let wall-clock dt drive
+        // the playhead; the per-frame mapping in sync_media_to_playhead
+        // takes care of feeding the right FILE PTS to the video player.
+        const bool one_x = active && std::abs(active->speed - 1.0) < 1e-6;
+        if (one_x && active_m && active_m->path == current_media_path_) {
             const core::TimeUs file_pts = audio_.current_pts_us();
             if (file_pts >= active->src_in && file_pts < active->src_out) {
-                const double dur_src = double(file_pts - active->src_in);
-                const double dur_tl  = (active->speed > 0.0)
-                                     ? dur_src / active->speed
-                                     : dur_src;
                 const core::TimeUs ph_audio =
-                    active->t_in + core::TimeUs(dur_tl);
+                    active->t_in + (file_pts - active->src_in);
                 // Snap on big jumps (>50ms drift), low-pass-filter on small.
                 core::TimeUs delta = ph_audio - ph;
                 if (delta < -50'000 || delta > 50'000) {
@@ -277,33 +278,86 @@ void App::extract_audio_to_sidecar() {
 }
 
 void App::sync_media_to_playhead() {
-    if (project_.clips().empty()) return;
-
     const core::Clip* top = nullptr;
     const core::Clip* bot = nullptr;
-    project_.clips_at(project_.playhead(), &top, &bot);
+    if (!project_.clips().empty()) {
+        project_.clips_at(project_.playhead(), &top, &bot);
+    }
+    // An A-track clip can outlive the V-track clip whose audio it was
+    // detached from (the user may move/extend it). When that happens
+    // we still want the audio engine to keep playing this file, so
+    // promote the highest-index A-track clip into "top" if no video
+    // clip is at the playhead.
+    const core::Clip* audio_only_top = nullptr;
+    if (!top) {
+        const core::TimeUs ph = project_.playhead();
+        for (const auto& c : project_.clips()) {
+            if (c.track >= 0) continue;
+            if (ph < c.t_in || ph >= c.t_out()) continue;
+            if (!audio_only_top || c.track > audio_only_top->track) {
+                audio_only_top = &c;
+            }
+        }
+    }
+
+    // No video AND no audio clip alive at the current playhead: gap,
+    // project emptied, or playhead past duration. The audio engine
+    // still has whatever file it last loaded mapped, and its WASAPI
+    // worker keeps consuming samples until paused — that's what
+    // produced the "I deleted the clip but the sound keeps playing"
+    // report. Mute and pause it; the viewer's per-frame "no top
+    // frame" branch already drops to black.
+    if (!top && !bot && !audio_only_top) {
+        audio_.pause();
+        audio_.set_muted(true);
+        if (!current_media_path_.empty()) {
+            player_.close();
+            current_media_path_.clear();
+        }
+        if (!current_media_path_bot_.empty()) {
+            player_bot_.close();
+            current_media_path_bot_.clear();
+        }
+        return;
+    }
 
     // ---- Top track / audio master ----
-    if (top) {
-        const core::Media* m = project_.find_media(top->media_id);
+    // For purposes of "what file should the audio engine and the top
+    // video player be loaded with", an A-track clip overrides when
+    // there's no V-track clip at the playhead. The video stage will
+    // see top == nullptr, leave the canvas black, and the audio stage
+    // will play this file.
+    const core::Clip* audio_master = top ? top : audio_only_top;
+    if (audio_master) {
+        const core::Media* m = project_.find_media(audio_master->media_id);
         if (m && m->path != current_media_path_) {
             const std::wstring wanted = m->path;
             log::info("sync_media_to_playhead: TOP -> %s",
                       volchay::narrow(wanted).c_str());
-            player_.set_prefer_hardware(settings_.hardware_decode);
-            if (player_.open(wanted, d3d_.device())) {
-                current_media_path_ = wanted;
-            } else {
-                log::err("sync_media_to_playhead: TOP failed to open %s",
-                         volchay::narrow(wanted).c_str());
+            // Only open the video decoder when we actually have a
+            // V-track clip at the playhead. For an A-only window we
+            // want the canvas to stay black until we hit a V clip.
+            if (top) {
+                player_.set_prefer_hardware(settings_.hardware_decode);
+                if (player_.open(wanted, d3d_.device())) {
+                    current_media_path_ = wanted;
+                } else {
+                    log::err("sync_media_to_playhead: TOP failed to open %s",
+                             volchay::narrow(wanted).c_str());
+                }
+            } else if (!current_media_path_.empty()) {
+                player_.close();
+                current_media_path_.clear();
             }
             audio_.open(wanted);
             audio_.set_volume(settings_.audio_volume);
             audio_.set_muted(settings_.audio_mute);
-            const core::TimeUs file_t =
-                project_.source_time_at(project_.playhead());
+            const core::TimeUs offset_on_tl =
+                project_.playhead() - audio_master->t_in;
+            const core::TimeUs file_t = audio_master->src_in
+                + core::TimeUs(double(offset_on_tl) * audio_master->speed);
             if (file_t >= 0) {
-                player_.seek(file_t);
+                if (top) player_.seek(file_t);
                 audio_.seek(file_t);
             }
             if (project_.is_playing()) audio_.play();
@@ -394,14 +448,39 @@ void App::render_one_frame() {
     {
         float       gain = settings_.audio_volume;
         bool        mute = settings_.audio_mute;
-        const auto& cs   = project_.clips();
         const core::TimeUs ph = project_.playhead();
-        for (const auto& c : cs) {
-            if (ph >= c.t_in && ph < c.t_out()) {
-                gain *= c.volume;
-                if (c.muted) mute = true;
-                break;
-            }
+        // Resolve the clip that drives audio mute / volume at the
+        // playhead. Priority order:
+        //   1) An A-track (track < 0) clip overlapping the playhead —
+        //      that's where "Extract audio" puts the audio. If
+        //      multiple, the highest A-track index (closest to A1)
+        //      wins.
+        //   2) Otherwise, the topmost video clip — the same one
+        //      sync_media_to_playhead loaded into the audio engine.
+        // This keeps the per-clip Inspector controls on V0 from
+        // overriding a non-muted A1 clip.
+        const core::Clip* audio_clip = nullptr;
+        for (const auto& c : project_.clips()) {
+            if (c.track >= 0) continue;
+            if (ph < c.t_in || ph >= c.t_out()) continue;
+            if (!audio_clip || c.track > audio_clip->track) audio_clip = &c;
+        }
+        if (!audio_clip) {
+            const core::Clip* top = nullptr;
+            const core::Clip* bot = nullptr;
+            project_.clips_at(ph, &top, &bot);
+            audio_clip = top ? top : bot;
+        }
+        if (audio_clip) {
+            gain *= audio_clip->volume;
+            if (audio_clip->muted) mute = true;
+            // Slow / fast clips: the audio engine plays at the source's
+            // native rate so its output would race ahead (or fall
+            // behind) the timeline. Mute it so we don't hear "fast
+            // audio for 1s then silence for 3s" at 0.25x. Proper
+            // speed-aware audio (atempo / SWR rate change) is on the
+            // todo list.
+            if (std::abs(audio_clip->speed - 1.0) > 1e-6) mute = true;
         }
         audio_.set_volume(gain);
         audio_.set_muted(mute);

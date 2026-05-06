@@ -7,6 +7,9 @@
 
 #include <imgui.h>
 
+#include <cstdio>
+#include <string>
+
 namespace volchay::ui::panels {
 
 void draw_inspector(EditorContext& ctx) {
@@ -18,22 +21,57 @@ void draw_inspector(EditorContext& ctx) {
         return;
     }
 
-    // Pick the clip the user is editing: prefer the currently selected
-    // clip; if nothing is selected, fall back to the clip under the
-    // playhead; otherwise the first clip on the timeline.
+    // Inspector edits the SELECTED clip — and only the selected one.
+    // Falling back to "first clip on the timeline" when nothing is
+    // selected meant that toggling Mute / Volume / Speed silently
+    // patched a different clip than the user thought they were
+    // editing — which is what produced the "I muted one and it muted
+    // everything" report. Now we only act on an explicit selection;
+    // when nothing is selected we show a helpful empty state.
     auto& clips = ctx.project->clips_mut();
     core::Clip* clip_ptr = nullptr;
+    int n_selected = 0;
     for (auto& c : clips) {
-        if (c.selected) { clip_ptr = &c; break; }
-    }
-    if (!clip_ptr) {
-        const core::TimeUs ph = ctx.project->playhead();
-        for (auto& c : clips) {
-            if (ph >= c.t_in && ph < c.t_out()) { clip_ptr = &c; break; }
+        if (c.selected) {
+            ++n_selected;
+            if (!clip_ptr) clip_ptr = &c;
         }
     }
-    if (!clip_ptr) clip_ptr = &clips.front();
+    if (!clip_ptr) {
+        ImGui::TextColored(theme().text_dim,
+            "No clip selected.\n"
+            "Click a clip on the timeline to edit its trim, speed, "
+            "volume, mute, position and transform here.");
+        ImGui::End();
+        return;
+    }
+    if (n_selected > 1) {
+        ImGui::TextColored(theme().text_dim,
+            "%d clips selected — showing the first one. "
+            "Click a single clip on the timeline to edit it on its own.",
+            n_selected);
+        ImGui::Spacing();
+    }
     auto& clip = *clip_ptr;
+
+    // Clip header — make it obvious which clip's properties are being
+    // edited. The name shown is the source basename plus the track
+    // identifier (V1 / V2 / A1 / ...).
+    {
+        std::string label = clip.media_id;
+        auto pos = label.find_last_of("/\\");
+        if (pos != std::string::npos) label = label.substr(pos + 1);
+        char tlbl[8];
+        if (clip.track >= 0) {
+            std::snprintf(tlbl, sizeof(tlbl), "V%d", clip.track + 1);
+        } else {
+            std::snprintf(tlbl, sizeof(tlbl), "A%d", -clip.track);
+        }
+        ImGui::TextColored(theme().accent, "%s", tlbl);
+        ImGui::SameLine();
+        ImGui::TextUnformatted(label.c_str());
+        ImGui::Separator();
+    }
 
     ImGui::TextColored(theme().text_dim, "Source");
     ImGui::Separator();

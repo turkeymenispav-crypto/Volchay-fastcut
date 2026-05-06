@@ -636,15 +636,32 @@ static void run_project_export(ExportRequest req,
               v_enc->name, out_w, out_h, fps_num, fps_den,
               av_get_pix_fmt_name(v_enc_ctx->pix_fmt));
 
-    // Pick audio source: lowest-track clip in trim range. (Single-source
-    // mixing is sufficient for the user's main case where V0 has the
-    // master audio and V1+ are picture-in-picture overlays.)
+    // Pick audio source. Priority:
+    //   1) An A-track clip (track < 0) — that's where "Extract audio"
+    //      moved the user's audio after detaching it from a video.
+    //      If there are several, prefer the highest A-track index
+    //      (closest to A1 == -1) since that's the visual "top" audio
+    //      lane and matches the user's intuition of A1 being primary.
+    //   2) Otherwise, the lowest non-muted V-track clip — which is the
+    //      typical V0-master case with V1+ being PIP overlays.
+    // Fully-muted clips never act as audio sources.
     const Clip* audio_clip = nullptr;
     for (const auto& c : proj.clips()) {
-        if (c.track < 0) continue;
+        if (c.track >= 0) continue;
+        if (c.muted) continue;
         if (c.t_in >= req.trim_end_us) continue;
         if (c.t_out() <= req.trim_start_us) continue;
-        if (!audio_clip || c.track < audio_clip->track) audio_clip = &c;
+        // Higher (less negative) wins — A1 (-1) > A2 (-2) > ...
+        if (!audio_clip || c.track > audio_clip->track) audio_clip = &c;
+    }
+    if (!audio_clip) {
+        for (const auto& c : proj.clips()) {
+            if (c.track < 0) continue;
+            if (c.muted) continue;
+            if (c.t_in >= req.trim_end_us) continue;
+            if (c.t_out() <= req.trim_start_us) continue;
+            if (!audio_clip || c.track < audio_clip->track) audio_clip = &c;
+        }
     }
     AVFormatContext* a_in_fmt = nullptr;
     AVCodecContext*  a_dec_ctx = nullptr;
@@ -751,6 +768,10 @@ static void run_project_export(ExportRequest req,
     // media_id used by clips in the trim range.
     std::map<std::string, std::unique_ptr<VideoSource>> sources;
     for (const auto& c : proj.clips()) {
+        // Audio-only sub-track clips don't contribute video, so we
+        // don't open a video decoder for them. Their picture stream
+        // (if the source has one) would just waste seek time.
+        if (c.track < 0)                 continue;
         if (c.t_in >= req.trim_end_us)   continue;
         if (c.t_out() <= req.trim_start_us) continue;
         if (sources.count(c.media_id))   continue;
@@ -872,6 +893,12 @@ static void run_project_export(ExportRequest req,
         const Clip* top = nullptr;
         const Clip* bot = nullptr;
         proj.clips_at(tl_us, &top, &bot);
+        // clips_at() doesn't filter by visual vs audio-only — audio
+        // sub-tracks live on negative track indices and don't carry
+        // pictures. Drop them so the export's video stage doesn't try
+        // to composite from a source we never opened.
+        if (top && top->track < 0) top = nullptr;
+        if (bot && bot->track < 0) bot = nullptr;
 
         canvas_black(canvas);
         if (bot) {
@@ -1018,7 +1045,9 @@ void Exporter::run_one_export(ExportRequest req) {
         bool needs_project = clips.size() > 1;
         if (!needs_project) {
             for (const auto& c : clips) {
-                if (c.track > 0) { needs_project = true; break; }
+                // Any non-V0 clip (overlay or audio sub-track) needs
+                // the multi-source compositing path.
+                if (c.track != 0) { needs_project = true; break; }
             }
         }
         if (needs_project) {
