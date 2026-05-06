@@ -525,14 +525,29 @@ inline void plane_off(const AVFrame* f, int off_x, int off_y,
 
 inline void canvas_black(AVFrame* f) {
     const AVPixelFormat fmt = (AVPixelFormat)f->format;
-    if (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUV422P
-     || fmt == AV_PIX_FMT_YUV444P) {
-        std::memset(f->data[0], 0,   f->linesize[0] * f->height);
-        std::memset(f->data[1], 128, f->linesize[1] * f->height);
-        std::memset(f->data[2], 128, f->linesize[2] * f->height);
-    } else if (fmt == AV_PIX_FMT_NV12) {
-        std::memset(f->data[0], 0,   f->linesize[0] * f->height);
-        std::memset(f->data[1], 128, f->linesize[1] * f->height);
+    const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fmt);
+    if (!d) return;
+    // Plane heights depend on chroma subsampling. For YUV420P the
+    // chroma planes are half the picture height; writing
+    // linesize[1]*height there overflows the actual buffer and
+    // produces a heap corruption that surfaces as a crash anywhere
+    // from the next av_frame_alloc to swr_convert. Use the descriptor
+    // to compute each plane's true byte count.
+    const int luma_bytes = f->linesize[0] * f->height;
+    if (f->data[0]) std::memset(f->data[0], 0, luma_bytes);
+    for (int p = 1; p < 4; ++p) {
+        if (!f->data[p] || !f->linesize[p]) continue;
+        // Find which chroma component lives on plane p, take its
+        // log2_chroma_h subsampling.
+        int vsub = 0;
+        for (int c = 0; c < d->nb_components; ++c) {
+            if (d->comp[c].plane == p) {
+                if (c == 1 || c == 2) vsub = d->log2_chroma_h;
+                break;
+            }
+        }
+        const int rows = (f->height + (1 << vsub) - 1) >> vsub;
+        std::memset(f->data[p], 128, f->linesize[p] * rows);
     }
 }
 
@@ -1474,19 +1489,29 @@ void Exporter::run_one_export(ExportRequest req) {
         plane_offsets(f, sx0, sy0, out_data, out_ls);
     };
 
-    // Black-fill the encoder canvas. For YUV420P / YUV422P / YUV444P
-    // we set Y=0 and chroma=128 (neutral gray). For NV12 the chroma
-    // plane is interleaved UV at the same neutral.
+    // Black-fill the encoder canvas. Plane heights depend on the
+    // chroma subsampling — for YUV420P the chroma planes are half
+    // the picture height. memset-ing linesize[1]*height there
+    // overflows the actual buffer and corrupts the heap (crashes
+    // somewhere downstream, often inside swr_convert / av_frame_alloc).
     auto fill_canvas_black = [&](AVFrame* f) {
         const AVPixelFormat fmt = (AVPixelFormat)f->format;
-        if (fmt == AV_PIX_FMT_YUV420P || fmt == AV_PIX_FMT_YUV422P
-         || fmt == AV_PIX_FMT_YUV444P) {
-            std::memset(f->data[0], 0,   f->linesize[0] * f->height);
-            std::memset(f->data[1], 128, f->linesize[1] * f->height);
-            std::memset(f->data[2], 128, f->linesize[2] * f->height);
-        } else if (fmt == AV_PIX_FMT_NV12) {
-            std::memset(f->data[0], 0,   f->linesize[0] * f->height);
-            std::memset(f->data[1], 128, f->linesize[1] * f->height);
+        const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fmt);
+        if (!d) return;
+        if (f->data[0]) {
+            std::memset(f->data[0], 0, f->linesize[0] * f->height);
+        }
+        for (int p = 1; p < 4; ++p) {
+            if (!f->data[p] || !f->linesize[p]) continue;
+            int vsub = 0;
+            for (int cc = 0; cc < d->nb_components; ++cc) {
+                if (d->comp[cc].plane == p) {
+                    if (cc == 1 || cc == 2) vsub = d->log2_chroma_h;
+                    break;
+                }
+            }
+            const int rows = (f->height + (1 << vsub) - 1) >> vsub;
+            std::memset(f->data[p], 128, f->linesize[p] * rows);
         }
     };
 
